@@ -1,0 +1,22 @@
+# requirements.txt
+google-generativeai>=0.8.0
+google-api-core>=2.0
+langchain-google-genai>=2.0.0
+langchain-ollama>=0.2.0
+langchain-core>=0.3.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
+qdrant-client>=1.11.0
+pymupdf>=1.24.0
+python-docx>=1.1.0
+rank-bm25>=0.2.2
+nltk>=3.8
+pandas>=2.0
+tabulate>=0.9
+pydantic>=2.0
+pydantic-settings>=2.0
+pillow>=10.0
+python-dotenv>=1.0
+flask>=3.0.0
+numpy>=1.24
+scikit-learn>=1.3

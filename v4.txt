@@ -1,0 +1,923 @@
+# Final Fixes — 6 Remaining Issues
+
+Only the changed files are shown below. Everything else stays the same.
+
+---
+
+## Fix #1: `_check_relevance` max_retries guard — `agent/rag_agent.py`
+
+```python
+# agent/rag_agent.py
+"""
+LangGraph-based Agentic RAG agent.
+
+All fixes applied including:
+- FIX #6: Revalidation loop guarded by max_retries
+- FIX #1 (this round): _check_relevance also guarded by max_retries
+- Separate general vs RAG generation paths
+- Revalidation routing
+- Strict support grading
+- Read max_retries from state
+"""
+
+import logging
+from typing import Literal
+
+from langgraph.graph import StateGraph, END
+from langchain_core.documents import Document
+
+from config import settings
+from retrieval.hybrid_retriever import HybridRetriever
+from retrieval.reranker import GemmaReranker
+from retrieval.parent_expander import ParentExpander
+from generation.self_rag import SelfRAG, RetrievalDecision, RelevanceGrade, SupportGrade
+from .state import RAGAgentState
+
+logger = logging.getLogger(__name__)
+
+
+class AgenticRAGAgent:
+    """Full Agentic RAG pipeline with LangGraph."""
+
+    def __init__(
+        self,
+        hybrid_retriever: HybridRetriever,
+        reranker: GemmaReranker,
+        parent_expander: ParentExpander,
+        self_rag: SelfRAG,
+    ):
+        self.retriever = hybrid_retriever
+        self.reranker = reranker
+        self.expander = parent_expander
+        self.self_rag = self_rag
+        self.max_retries = settings.max_retries
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        workflow = StateGraph(RAGAgentState)
+
+        # Nodes
+        workflow.add_node("route_query", self._route_query)
+        workflow.add_node("hybrid_retrieve", self._hybrid_retrieve)
+        workflow.add_node("rerank", self._rerank)
+        workflow.add_node("expand_parents", self._expand_parents)
+        workflow.add_node("revalidate", self._revalidate)
+        workflow.add_node("grade_relevance", self._grade_relevance)
+        workflow.add_node("generate_rag", self._generate_rag)
+        workflow.add_node("generate_general", self._generate_general)
+        workflow.add_node("evaluate_rag", self._evaluate_rag)
+        workflow.add_node("evaluate_general", self._evaluate_general)
+        workflow.add_node("transform_query", self._transform_query)
+
+        workflow.set_entry_point("route_query")
+
+        # Edges
+        workflow.add_conditional_edges(
+            "route_query",
+            self._should_retrieve,
+            {
+                "retrieve": "hybrid_retrieve",
+                "no_retrieval": "generate_general",
+            },
+        )
+
+        workflow.add_edge("hybrid_retrieve", "rerank")
+        workflow.add_edge("rerank", "expand_parents")
+        workflow.add_edge("expand_parents", "revalidate")
+
+        workflow.add_conditional_edges(
+            "revalidate",
+            self._check_revalidation,
+            {
+                "sufficient": "grade_relevance",
+                "insufficient": "transform_query",
+            },
+        )
+
+        workflow.add_conditional_edges(
+            "grade_relevance",
+            self._check_relevance,
+            {
+                "relevant": "generate_rag",
+                "irrelevant": "transform_query",
+            },
+        )
+
+        workflow.add_edge("generate_rag", "evaluate_rag")
+        workflow.add_edge("generate_general", "evaluate_general")
+        workflow.add_edge("evaluate_general", END)
+
+        workflow.add_conditional_edges(
+            "evaluate_rag",
+            self._check_evaluation,
+            {
+                "pass": END,
+                "fail": "transform_query",
+                "max_retries": END,
+            },
+        )
+
+        workflow.add_edge("transform_query", "hybrid_retrieve")
+
+        return workflow.compile()
+
+    # ── Node Implementations ────────────────────────────────────────
+
+    def _route_query(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        decision, reasoning = self.self_rag.decide_retrieval(query)
+        logger.info(
+            f"Retrieval decision for '{query[:50]}...': "
+            f"{decision.value} — {reasoning}"
+        )
+        return {
+            "retrieval_decision": decision,
+            "retrieval_reasoning": reasoning,
+            "original_query": state.get("original_query", query),
+        }
+
+    def _hybrid_retrieve(self, state: RAGAgentState) -> dict:
+        results = self.retriever.retrieve(query=state["query"])
+        return {"raw_documents": results}
+
+    def _rerank(self, state: RAGAgentState) -> dict:
+        raw_docs = state.get("raw_documents", [])
+        if not raw_docs:
+            return {"reranked_documents": []}
+        reranked = self.reranker.rerank(query=state["query"], documents=raw_docs)
+        return {"reranked_documents": reranked}
+
+    def _expand_parents(self, state: RAGAgentState) -> dict:
+        reranked = state.get("reranked_documents", [])
+        child_results = [(doc, score) for doc, score, _ in reranked]
+        expanded = self.expander.expand(child_results)
+        return {"expanded_documents": expanded}
+
+    def _revalidate(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        documents = state.get("expanded_documents", [])
+
+        if len(documents) < 2:
+            return {
+                "revalidation_result": {
+                    "sufficient_information": True,
+                    "contradictions_found": False,
+                }
+            }
+
+        result = self.reranker.revalidate(query=query, documents=documents)
+        logger.info(
+            f"Re-validation: sufficient={result.get('sufficient_information')}, "
+            f"contradictions={result.get('contradictions_found')}"
+        )
+        return {"revalidation_result": result}
+
+    def _grade_relevance(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        documents = state.get("expanded_documents", [])
+        grade, relevant_docs, reasoning = self.self_rag.grade_relevance_batch(
+            query, documents
+        )
+        logger.info(f"Relevance: {grade.value} — {reasoning}")
+        return {"relevance_grade": grade, "relevant_documents": relevant_docs}
+
+    def _generate_rag(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        documents = (
+            state.get("relevant_documents")
+            or state.get("expanded_documents", [])
+        )
+        generation = self.self_rag.generate_with_docs(query, documents)
+        return {"generation": generation}
+
+    def _generate_general(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        generation = self.self_rag.generate_general(query)
+        return {"generation": generation}
+
+    def _evaluate_rag(self, state: RAGAgentState) -> dict:
+        """Evaluate RAG-generated response: support + usefulness."""
+        query = state["query"]
+        generation = state.get("generation", "")
+        documents = (
+            state.get("relevant_documents")
+            or state.get("expanded_documents", [])
+        )
+        num_retries = state.get("num_retries", 0)
+
+        support_grade, unsupported, support_reasoning = self.self_rag.grade_support(
+            query, generation, documents
+        )
+        logger.info(f"Support: {support_grade.value} — {support_reasoning}")
+
+        usefulness_score, usefulness_reasoning = self.self_rag.grade_usefulness(
+            query, generation
+        )
+        logger.info(f"Usefulness: {usefulness_score}/5 — {usefulness_reasoning}")
+
+        if settings.strict_support:
+            support_pass = (
+                support_grade == SupportGrade.FULLY_SUPPORTED and not unsupported
+            )
+        else:
+            support_pass = support_grade in (
+                SupportGrade.FULLY_SUPPORTED,
+                SupportGrade.PARTIALLY_SUPPORTED,
+            )
+
+        usefulness_pass = usefulness_score >= settings.usefulness_min_score
+        is_successful = support_pass and usefulness_pass
+
+        if is_successful:
+            final_answer = generation
+        elif num_retries >= state.get("max_retries", self.max_retries):
+            final_answer = generation  # Best effort
+            is_successful = False
+        else:
+            final_answer = None
+
+        return {
+            "support_grade": support_grade,
+            "support_unsupported_claims": unsupported,
+            "usefulness_score": usefulness_score,
+            "usefulness_reasoning": usefulness_reasoning,
+            "final_answer": final_answer,
+            "is_successful": is_successful,
+        }
+
+    def _evaluate_general(self, state: RAGAgentState) -> dict:
+        """Evaluate general (no-retrieval) responses. Usefulness only."""
+        query = state["query"]
+        generation = state.get("generation", "")
+
+        usefulness_score, usefulness_reasoning = self.self_rag.grade_usefulness(
+            query, generation
+        )
+        is_successful = usefulness_score >= settings.usefulness_min_score
+
+        return {
+            "support_grade": SupportGrade.FULLY_SUPPORTED,
+            "support_unsupported_claims": [],
+            "usefulness_score": usefulness_score,
+            "usefulness_reasoning": usefulness_reasoning,
+            "final_answer": generation,
+            "is_successful": is_successful,
+        }
+
+    def _transform_query(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        num_retries = state.get("num_retries", 0)
+
+        support_grade = state.get("support_grade")
+        usefulness_score = state.get("usefulness_score", 3)
+        relevance_grade = state.get("relevance_grade")
+        revalidation = state.get("revalidation_result", {})
+
+        failure_parts: list[str] = []
+        if revalidation and not revalidation.get(
+            "sufficient_information", True
+        ):
+            failure_parts.append(
+                "Retrieved documents contain insufficient information"
+            )
+        if revalidation and revalidation.get("contradictions_found"):
+            failure_parts.append(
+                "Retrieved documents contain contradictions"
+            )
+        if relevance_grade == RelevanceGrade.IRRELEVANT:
+            failure_parts.append(
+                "Retrieved documents were irrelevant to the query"
+            )
+        if support_grade == SupportGrade.NO_SUPPORT:
+            failure_parts.append(
+                "Generated response was not supported by documents"
+            )
+        if (
+            support_grade == SupportGrade.PARTIALLY_SUPPORTED
+            and settings.strict_support
+        ):
+            failure_parts.append(
+                "Generated response was only partially supported"
+            )
+        if usefulness_score and usefulness_score < settings.usefulness_min_score:
+            failure_parts.append(
+                f"Response usefulness was low ({usefulness_score}/5)"
+            )
+
+        failure_reason = "; ".join(failure_parts) or "Previous attempt failed"
+
+        transformed_query, strategy = self.self_rag.transform_query(
+            query, failure_reason
+        )
+        logger.info(
+            f"Query transformed (retry {num_retries + 1}): "
+            f"'{query[:50]}...' → '{transformed_query[:50]}...' "
+            f"(strategy: {strategy})"
+        )
+
+        return {
+            "query": transformed_query,
+            "num_retries": num_retries + 1,
+            "transformation_history": [f"{strategy}: {transformed_query}"],
+        }
+
+    # ── Conditional Edges ───────────────────────────────────────────
+
+    def _should_retrieve(
+        self, state: RAGAgentState
+    ) -> Literal["retrieve", "no_retrieval"]:
+        decision = state.get("retrieval_decision", RetrievalDecision.RETRIEVE)
+        return (
+            "retrieve"
+            if decision == RetrievalDecision.RETRIEVE
+            else "no_retrieval"
+        )
+
+    def _check_revalidation(
+        self, state: RAGAgentState
+    ) -> Literal["sufficient", "insufficient"]:
+        """Route based on revalidation, guarded against infinite loops."""
+        num_retries = state.get("num_retries", 0)
+        max_retries = state.get("max_retries", self.max_retries)
+
+        if num_retries >= max_retries:
+            logger.warning(
+                f"Max retries ({max_retries}) reached in revalidation loop, "
+                f"proceeding with current documents."
+            )
+            return "sufficient"
+
+        result = state.get("revalidation_result", {})
+        sufficient = result.get("sufficient_information", True)
+        contradictions = result.get("contradictions_found", False)
+
+        if not sufficient or contradictions:
+            logger.info(
+                f"Revalidation routing: insufficient={not sufficient}, "
+                f"contradictions={contradictions} → transform query"
+            )
+            return "insufficient"
+        return "sufficient"
+
+    def _check_relevance(
+        self, state: RAGAgentState
+    ) -> Literal["relevant", "irrelevant"]:
+        """
+        FIX #1: Mirror the same max_retries guard as _check_revalidation.
+        
+        Without this guard, the loop:
+          grade_relevance: IRRELEVANT
+            → transform_query (num_retries increments past max)
+            → hybrid_retrieve → rerank → expand
+            → revalidate: _check_revalidation sees retries >= max → "sufficient"
+            → grade_relevance: IRRELEVANT again
+            → transform_query (num_retries keeps climbing)
+            → ... ∞
+        
+        Now both exit points from the retrieve→evaluate cycle check max_retries,
+        ensuring the graph always reaches generate or END within bounded steps.
+        """
+        num_retries = state.get("num_retries", 0)
+        max_retries = state.get("max_retries", self.max_retries)
+
+        if num_retries >= max_retries:
+            logger.warning(
+                f"Max retries ({max_retries}) reached in relevance check — "
+                f"proceeding to generation with available documents."
+            )
+            return "relevant"
+
+        grade = state.get("relevance_grade", RelevanceGrade.RELEVANT)
+        return "relevant" if grade == RelevanceGrade.RELEVANT else "irrelevant"
+
+    def _check_evaluation(
+        self, state: RAGAgentState
+    ) -> Literal["pass", "fail", "max_retries"]:
+        if state.get("is_successful"):
+            return "pass"
+        num_retries = state.get("num_retries", 0)
+        max_retries = state.get("max_retries", self.max_retries)
+        if num_retries >= max_retries:
+            logger.warning(
+                f"Max retries ({max_retries}) reached. Returning best effort."
+            )
+            return "max_retries"
+        return "fail"
+
+    # ── Public Interface ────────────────────────────────────────────
+
+    def invoke(self, query: str) -> dict:
+        initial_state: RAGAgentState = {
+            "query": query,
+            "original_query": query,
+            "raw_documents": [],
+            "reranked_documents": [],
+            "expanded_documents": [],
+            "relevant_documents": [],
+            "revalidation_result": None,
+            "generation": None,
+            "retrieval_decision": None,
+            "retrieval_reasoning": None,
+            "relevance_grade": None,
+            "support_grade": None,
+            "support_unsupported_claims": [],
+            "usefulness_score": None,
+            "usefulness_reasoning": None,
+            "num_retries": 0,
+            "max_retries": self.max_retries,
+            "transformation_history": [],
+            "final_answer": None,
+            "is_successful": False,
+            "error_message": None,
+        }
+
+        result = self.graph.invoke(initial_state)
+
+        return {
+            "answer": result.get("final_answer")
+            or result.get("generation", ""),
+            "is_successful": result.get("is_successful", False),
+            "retrieval_decision": result.get("retrieval_decision"),
+            "relevance_grade": result.get("relevance_grade"),
+            "support_grade": result.get("support_grade"),
+            "usefulness_score": result.get("usefulness_score"),
+            "documents": result.get("relevant_documents")
+            or result.get("expanded_documents", []),
+            "num_retries": result.get("num_retries", 0),
+            "transformations": result.get("transformation_history", []),
+            "revalidation": result.get("revalidation_result"),
+        }
+```
+
+---
+
+## Fix #2: `grade_usefulness` default score on failure — `generation/self_rag.py`
+
+Only the changed method is shown. Everything else in the file stays the same.
+
+```python
+    def grade_usefulness(
+        self, query: str, response: str
+    ) -> tuple[int, str]:
+        """
+        Grade response usefulness.
+
+        FIX #2: Default score on API failure is now 1 (clearly failing)
+        instead of 3 (which equals usefulness_min_score and silently passes).
+        """
+        content = f"Query: {query}\n\nResponse:\n{response}"
+        result = self._invoke_json(USEFULNESS_PROMPT, content)
+        # FIX #2: Default to 1 (fail) not 3 (ambiguous pass)
+        # When _invoke_json returns {} on API failure, score=1 ensures
+        # usefulness_score < usefulness_min_score, correctly marking the
+        # evaluation as failed instead of silently passing.
+        score = int(result.get("score", 1))
+        reasoning = result.get("reasoning", "API failure — defaulting to fail")
+        return max(1, min(5, score)), reasoning
+```
+
+---
+
+## Fix #3: Batch reranker adaptive truncation — `retrieval/reranker.py`
+
+Only the `_batch_score` method is changed. Everything else stays the same.
+
+```python
+    def _batch_score(
+        self, query: str, documents: list[tuple[Document, float]]
+    ) -> Optional[dict[int, tuple[int, str]]]:
+        """
+        Score all documents in a single LLM call.
+
+        FIX #3: Adaptively scale truncation to stay within num_ctx.
+        For 10 technical documents at 1000 chars each, the total can
+        reach 4,000+ tokens — breaching 8,192 with prompt overhead.
+        Now: max_chars = (available_tokens - safety_margin) * chars_per_token // num_docs
+        """
+        if not documents:
+            return None
+
+        docs_text = ""
+        # FIX #3: Scale truncation based on number of documents
+        # Available context: 8192 tokens - ~500 for prompt/query overhead
+        # Conservative: ~3 chars per token for technical content (tables, code)
+        available_tokens = 8192 - 500
+        chars_per_token = 3
+        max_chars_per_doc = max(
+            200,
+            (available_tokens * chars_per_token) // max(len(documents), 1),
+        )
+
+        for i, (doc, _) in enumerate(documents):
+            truncated = doc.page_content[:max_chars_per_doc]
+            docs_text += f"\n--- Document {i} ---\n{truncated}\n"
+
+        try:
+            response = self.llm.invoke(
+                [
+                    SystemMessage(content=BATCH_RERANK_PROMPT),
+                    HumanMessage(content=f"Query: {query}\n{docs_text}"),
+                ]
+            )
+            raw = extract_json(response.content)
+            data = json.loads(raw)
+
+            if isinstance(data, dict) and "grades" not in data:
+                if "doc_index" in data:
+                    data = {"grades": [data]}
+                else:
+                    data = {"grades": []}
+
+            result: dict[int, tuple[int, str]] = {}
+            for item in data.get("grades", []):
+                idx = int(item.get("doc_index", 0))
+                score = max(1, min(10, int(item.get("score", 5))))
+                reasoning = item.get("reasoning", "")
+                result[idx] = (score, reasoning)
+
+            return result if result else None
+
+        except Exception as e:
+            logger.warning(
+                f"Batch reranking failed: {e}. Falling back to per-doc."
+            )
+            return None
+```
+
+---
+
+## Fix #4: Remove unused `file_hash` parameter — `ingestion/pdf_parser.py`
+
+Only the changed methods are shown. Everything else stays the same.
+
+```python
+    def parse(self, file_path: str | Path) -> tuple[list[ParsedPage], str]:
+        """
+        Parse a PDF file into ParsedPage objects.
+        Returns: (pages, file_hash)
+        """
+        file_path = Path(file_path)
+        file_hash = compute_file_hash(file_path)
+        pages = []
+
+        doc = fitz.open(str(file_path))
+        try:
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                # FIX #4: Removed unused file_hash parameter
+                page_data = self._parse_page(page, page_num, file_path.name)
+                pages.append(page_data)
+        finally:
+            doc.close()
+
+        logger.info(f"Parsed {len(pages)} pages from {file_path.name}")
+        return pages, file_hash
+
+    def _parse_page(
+        self, page, page_num: int, source_name: str
+    ) -> ParsedPage:
+        """
+        Parse a single PDF page.
+
+        FIX #4: Removed unused file_hash parameter from signature.
+        """
+        # ── 1. Direct text extraction ───────────────────────────────
+        text_content = page.get_text("text")
+
+        # ── 2. Extract tables (PyMuPDF built-in) ───────────────────
+        tables = page.find_tables()
+        table_texts = []
+        for table in tables:
+            try:
+                df = table.to_pandas()
+                table_texts.append(f"\n[TABLE]\n{df.to_markdown()}\n[/TABLE]\n")
+            except Exception:
+                pass
+
+        if table_texts:
+            text_content += "\n" + "\n".join(table_texts)
+
+        # ── 3. Smart VLM: only OCR if text density is low ──────────
+        page_images: list[str] = []
+        vlm_content = ""
+        text_density = len(text_content.strip())
+
+        if text_density < settings.vlm_text_density_threshold:
+            page_images = self._render_page_images(page, page_num)
+            if page_images:
+                vlm_content = rate_limited_generate(
+                    self.vlm_model,
+                    [VLM_OCR_PROMPT, self._b64_to_pil(page_images[0])],
+                    max_retries=settings.vlm_rate_limit_retries,
+                ) or ""
+        else:
+            logger.debug(
+                f"Page {page_num + 1}: text density={text_density}, "
+                f"skipping full-page VLM OCR"
+            )
+
+        # ── 4. Extract embedded images for VLM description ─────────
+        embedded_descriptions = self._describe_embedded_images(page, page_num)
+        if embedded_descriptions:
+            vlm_content = (vlm_content + "\n\n" + embedded_descriptions).strip()
+
+        return ParsedPage(
+            page_number=page_num + 1,
+            text_content=text_content.strip(),
+            vlm_content=vlm_content.strip(),
+            images=page_images,
+            source_file=source_name,
+        )
+```
+
+---
+
+## Fix #5: `delete_by_file_hash` marks dirty without rebuilding — `storage/bm25_store.py`
+
+Only the `delete_by_file_hash` method is changed. Everything else stays the same.
+
+```python
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """
+        Delete all BM25 docs for a given file hash.
+
+        FIX #5: Only marks the index as dirty and clears in-memory
+        structures — does NOT call _rebuild_index() here. The actual
+        rebuild happens once when build_index() is called at the end
+        of the full ingestion batch in pipeline.ingest().
+
+        This avoids O(n) rebuilds inside a per-file deletion loop.
+        During re-ingestion of 5 files into a 50k-chunk corpus,
+        this saves ~10 unnecessary full rebuilds.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM bm25_documents WHERE file_hash = ?", (file_hash,)
+        )
+        self.conn.commit()
+
+        # Mark dirty so build_index() knows to rebuild
+        self._index_dirty = True
+
+        # Invalidate in-memory structures so search() doesn't use
+        # stale data if called before build_index()
+        self.doc_ids = []
+        self.tokenized_corpus = []
+        self.bm25 = None
+
+        return cursor.rowcount
+```
+
+---
+
+## Fix #6: `extract_json` balanced-brace matching — `utils.py`
+
+Only the `extract_json` function is changed. Everything else stays the same.
+
+```python
+def extract_json(raw: str) -> str:
+    """
+    Strip markdown code fences and extract the first valid JSON block.
+
+    FIX #6: Replaced greedy [\s\S]* regex with balanced-brace scanning.
+    The old regex re.search(r"(\\{[\\s\\S]*\\}|\\[[\\s\\S]*\\])", raw)
+    was greedy — it matched from the first { to the LAST } in the
+    entire string, producing invalid JSON when the LLM included
+    explanation text after the JSON block.
+
+    The new approach scans character by character, tracking nesting
+    depth, and returns the smallest balanced span. This correctly
+    handles:
+    - Nested JSON objects and arrays
+    - Preamble text before JSON
+    - Trailing explanation text after JSON
+    - String contents with braces (approximation — not a full parser)
+    """
+    # 1. Code fence block (non-greedy, most reliable)
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+        # Validate it looks like JSON before returning
+        if candidate and candidate[0] in ("{", "["):
+            return candidate
+
+    # 2. Balanced-brace scanning for bare JSON
+    # Try both object { } and array [ ] starters
+    for start_char, end_char in [("{", "}"), ("[", "]")]:
+        start = raw.find(start_char)
+        if start == -1:
+            continue
+
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start, len(raw)):
+            ch = raw[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if ch == "\\":
+                escape_next = True
+                continue
+
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    # Found a balanced span
+                    candidate = raw[start : i + 1].strip()
+                    if candidate:
+                        return candidate
+
+        # If we exhausted the string without balance, try the next start_char
+
+    # 3. Last resort: return raw text stripped
+    return raw.strip()
+```
+
+---
+
+## Complete Updated `utils.py` (for clarity)
+
+```python
+# utils.py
+"""
+Shared utilities used across the Agentic RAG system.
+"""
+
+import re
+import uuid
+import time
+import hashlib
+import logging
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ── JSON Extraction ─────────────────────────────────────────────────
+
+def extract_json(raw: str) -> str:
+    """
+    Strip markdown code fences and extract the first valid JSON block.
+
+    Uses balanced-brace scanning instead of a greedy regex to avoid
+    over-matching when LLM output includes explanation text around
+    the JSON block.
+    """
+    # 1. Code fence block (non-greedy, most reliable)
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+        if candidate and candidate[0] in ("{", "["):
+            return candidate
+
+    # 2. Balanced-brace scanning for bare JSON
+    for start_char, end_char in [("{", "}"), ("[", "]")]:
+        start = raw.find(start_char)
+        if start == -1:
+            continue
+
+        depth = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start, len(raw)):
+            ch = raw[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if ch == "\\":
+                escape_next = True
+                continue
+
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    candidate = raw[start : i + 1].strip()
+                    if candidate:
+                        return candidate
+
+    # 3. Last resort
+    return raw.strip()
+
+
+# ── Deterministic IDs ──────────────────────────────────────────────
+
+NAMESPACE_DOC = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+def make_deterministic_id(*parts: str) -> str:
+    """Generate a deterministic UUID5 from the given string parts."""
+    seed = ":".join(str(p) for p in parts)
+    return str(uuid.uuid5(NAMESPACE_DOC, seed))
+
+
+# ── File Hashing ───────────────────────────────────────────────────
+
+def compute_file_hash(file_path: str | Path) -> str:
+    """Compute SHA-256 hash of a file for deduplication."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+# ── Rate-Limited Gemini Call ───────────────────────────────────────
+
+def rate_limited_generate(
+    model,
+    contents,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+) -> Optional[str]:
+    """Call Gemini generate_content with exponential backoff on rate limits."""
+    from google.api_core.exceptions import ResourceExhausted
+
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(contents)
+            return response.text
+        except ResourceExhausted:
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"Gemini rate limited (attempt {attempt + 1}/{max_retries}), "
+                f"retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+        except Exception as e:
+            logger.error(f"Gemini generation error: {e}")
+            return None
+    logger.error(f"Max retries ({max_retries}) exceeded for Gemini call")
+    return None
+```
+
+---
+
+## Verification: All Infinite-Loop Paths Are Now Bounded
+
+The graph has exactly **three** conditional edges that can route to `transform_query`. Every one now has a `max_retries` guard:
+
+```
+                       ┌──────────────────────────────────────────────────┐
+                       │        ALL PATHS TO transform_query              │
+                       │        ARE GUARDED BY max_retries                │
+                       └──────────────────────────────────────────────────┘
+
+revalidate ──→ _check_revalidation ──┬─ "sufficient"  → grade_relevance
+                                      └─ "insufficient" → transform_query
+                                         ✅ GUARDED: if retries >= max → "sufficient"
+
+grade_relevance ──→ _check_relevance ─┬─ "relevant"    → generate_rag
+                                      └─ "irrelevant"  → transform_query
+                                         ✅ GUARDED: if retries >= max → "relevant"
+
+evaluate_rag ──→ _check_evaluation ───┬─ "pass"        → END
+                                      ├─ "fail"        → transform_query
+                                      └─ "max_retries" → END
+                                         ✅ GUARDED: if retries >= max → "max_retries"
+```
+
+**Worst-case step count** (with `max_retries=3`):
+
+```
+Step 1:  route_query → hybrid_retrieve → rerank → expand → revalidate
+Step 2:  _check_revalidation (retry 0 < 3) → "insufficient" → transform_query (retry → 1)
+Step 3:  hybrid_retrieve → rerank → expand → revalidate
+Step 4:  _check_revalidation (retry 1 < 3) → "sufficient" → grade_relevance
+Step 5:  _check_relevance (retry 1 < 3) → "irrelevant" → transform_query (retry → 2)
+Step 6:  hybrid_retrieve → rerank → expand → revalidate
+Step 7:  _check_revalidation (retry 2 < 3) → "sufficient" → grade_relevance
+Step 8:  _check_relevance (retry 2 < 3) → "irrelevant" → transform_query (retry → 3)
+Step 9:  hybrid_retrieve → rerank → expand → revalidate
+Step 10: _check_revalidation (retry 3 >= 3) → "sufficient" → grade_relevance
+Step 11: _check_relevance (retry 3 >= 3) → "relevant" → generate_rag → evaluate_rag
+Step 12: _check_evaluation → "pass" or "max_retries" → END
+
+Total: bounded at O(max_retries × 4) node visits = 12 steps max with max_retries=3
+```
+
+No unbounded loops are possible.

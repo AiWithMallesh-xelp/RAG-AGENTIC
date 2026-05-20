@@ -1,0 +1,1655 @@
+# Final Fixes — `source_id` Deletion + Qdrant Namespace
+
+Two structural changes across affected files. Everything else stays the same.
+
+---
+
+## Fix A: Stable `source_id` Deletion
+
+**Problem**: Deletion by `file_hash` only works when re-ingesting identical content. If `manual.pdf` is updated, its hash changes, and old chunks remain forever — polluting retrieval with stale data.
+
+**Solution**: Add `source_id` (absolute file path) as a stable document identity, separate from `file_hash` (content version). Delete by `source_id` before ingesting any new version.
+
+```
+source_id = str(Path(file_path).resolve())   # stable across content changes
+file_hash = sha256(file_content)              # changes when content changes
+```
+
+---
+
+## Fix B: Qdrant Collection Namespaced by `index_dir`
+
+**Problem**: Different `--index-dir` runs share one Qdrant collection but point to different SQLite databases, causing parent-expansion mismatches.
+
+**Solution**: Derive the Qdrant collection name from the index directory path so each index gets its own collection.
+
+---
+
+## `config.py` — Add namespace helper
+
+```python
+# config.py
+import hashlib
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from typing import Optional
+from pathlib import Path
+
+
+class Settings(BaseSettings):
+    """Central configuration for the Agentic RAG system."""
+
+    # ── API Keys & Endpoints ────────────────────────────────────────
+    google_api_key: str = Field(default="", alias="GOOGLE_API_KEY")
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    ollama_base_url: str = Field(
+        default="http://localhost:11434", alias="OLLAMA_BASE_URL"
+    )
+    qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
+    qdrant_api_key: Optional[str] = Field(
+        default=None, alias="QDRANT_API_KEY"
+    )
+
+    # ── Models ──────────────────────────────────────────────────────
+    llm_model: str = "gemini-2.0-flash-lite"
+    embedding_model: str = "models/text-embedding-004"
+    embedding_dim: int = 768
+    reranker_model: str = "gemma4:26b"
+
+    # ── Persistence ─────────────────────────────────────────────────
+    index_dir: str = Field(default="./index_data", alias="INDEX_DIR")
+
+    # ── Qdrant ──────────────────────────────────────────────────────
+    qdrant_collection_base: str = "agentic_rag_child"
+
+    # ── Chunking ────────────────────────────────────────────────────
+    parent_chunk_size: int = 1500
+    parent_chunk_overlap: int = 200
+    child_max_iterations: int = 25
+    child_min_text_length: int = 50
+
+    # ── Retrieval ───────────────────────────────────────────────────
+    vector_top_k: int = 10
+    bm25_top_k: int = 10
+    rerank_top_k: int = 5
+    rrf_k: int = 60
+
+    # ── Self-RAG ────────────────────────────────────────────────────
+    max_retries: int = 3
+    relevance_threshold: float = 0.6
+    support_threshold: float = 0.6
+    usefulness_min_score: int = 3
+    strict_support: bool = True
+
+    # ── VLM OCR ────────────────────────────────────────────────────
+    vlm_image_dpi: int = 200
+    vlm_max_images_per_page: int = 5
+    vlm_text_density_threshold: int = 500
+    vlm_rate_limit_retries: int = 5
+
+    # ── DOCX ────────────────────────────────────────────────────────
+    docx_chars_per_page: int = 3000
+
+    # ── Derived Paths ──────────────────────────────────────────────
+
+    @property
+    def db_path(self) -> Path:
+        return Path(self.index_dir) / "agentic_rag.db"
+
+    def ensure_index_dir(self) -> Path:
+        """Create index directory if it doesn't exist. Returns the path."""
+        p = Path(self.index_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def qdrant_collection_name(self) -> str:
+        """
+        Derive a Qdrant collection name from the index directory path.
+
+        FIX B: Different index_dir values produce different collection
+        names, preventing cross-contamination between independent indexes
+        that share the same Qdrant instance.
+
+        Example:
+            index_dir="./index_data"   → "agentic_rag_child_a1b2c3d4"
+            index_dir="./project_x"    → "agentic_rag_child_e5f6g7h8"
+        """
+        resolved = str(Path(self.index_dir).resolve())
+        dir_hash = hashlib.md5(resolved.encode()).hexdigest()[:8]
+        return f"{self.qdrant_collection_base}_{dir_hash}"
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
+
+
+settings = Settings()
+```
+
+---
+
+## `chunking/agentic_chunker.py` — Add `source_id` to all chunk metadata
+
+Only the `chunk_document` method and `_chunk_table` method change. The `_llm_semantic_chunker` method stays the same.
+
+```python
+# chunking/agentic_chunker.py
+"""
+LLM Agentic Chunking with Dynamic Metadata.
+
+Includes source_id (stable document identity) and file_hash
+(content version) in all chunk metadata.
+"""
+
+import json
+import re
+import logging
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from config import settings
+from utils import extract_json, make_deterministic_id
+from ingestion.pdf_parser import ParsedPage
+
+logger = logging.getLogger(__name__)
+
+
+CHUNKER_SYSTEM_PROMPT = """You are an expert document chunking agent. Your task is to read the provided text and extract exactly ONE logical, self-contained semantic chunk.
+
+Rules:
+1. Extract the text VERBATIM. Do not summarize, rephrase, or omit any words.
+2. The chunk should represent one complete thought, specification, or topic.
+3. After extracting the chunk, identify the EXACT last 5-10 words of your extracted chunk.
+4. Extract meaningful metadata as key-value pairs. Do NOT use generic keys like "key1". Use specific keys like "pump_model", "material", "valve_type", "pressure_rating", "section_title", "topic", "entity_type".
+
+You MUST respond ONLY with valid JSON in this exact format:
+{
+  "chunk_text": "the verbatim text you extracted...",
+  "last_few_words": "the exact last 5 to 10 words of the chunk_text",
+  "metadata": {
+    "specific_key_1": "specific_value_1",
+    "specific_key_2": "specific_value_2"
+  }
+}
+"""
+
+
+@dataclass
+class ChunkRelation:
+    parent_id: str
+    child_id: str
+    parent_text: str
+    child_text: str
+    child_metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ChunkedDocument:
+    parent_chunks: list[Document]
+    child_chunks: list[Document]
+    relations: list[ChunkRelation]
+
+
+class AgenticChunker:
+    """
+    Two-level agentic chunker:
+    - Parent: RecursiveCharacterTextSplitter (large context)
+    - Child: LLM-driven iterative semantic extraction (precise)
+    """
+
+    def __init__(self):
+        self.llm = ChatGoogleGenerativeAI(
+            model=settings.llm_model,
+            google_api_key=settings.google_api_key,
+            temperature=0.0,
+            max_output_tokens=4096,
+        )
+
+        self.parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.parent_chunk_size,
+            chunk_overlap=settings.parent_chunk_overlap,
+            separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
+        )
+
+    def chunk_document(
+        self,
+        pages: list[ParsedPage],
+        file_hash: str,
+        source_id: str,
+    ) -> ChunkedDocument:
+        """
+        Chunk a full document into parent + child chunks.
+
+        Args:
+            pages: Parsed pages from ingestion
+            file_hash: SHA-256 content hash (changes when content changes)
+            source_id: Stable document identity (e.g., absolute file path).
+                       Survives content changes so old versions can be deleted.
+        """
+        all_parent_chunks: list[Document] = []
+        all_child_chunks: list[Document] = []
+        all_relations: list[ChunkRelation] = []
+
+        for page in pages:
+            full_text = self._merge_page_content(page)
+            if not full_text.strip():
+                continue
+
+            parent_docs = self.parent_splitter.create_documents(
+                texts=[full_text],
+                metadatas=[
+                    {
+                        "source_file": page.source_file,
+                        "page": page.page_number,
+                        "content_type": "parent",
+                        "file_hash": file_hash,
+                        "source_id": source_id,
+                    }
+                ],
+            )
+
+            for parent_idx, parent_doc in enumerate(parent_docs):
+                parent_id = make_deterministic_id(
+                    source_id, page.page_number, "parent", parent_idx
+                )
+                parent_doc.metadata["doc_id"] = parent_id
+
+                table_blocks, text_parts = self._split_tables_and_text(
+                    parent_doc.page_content
+                )
+
+                for text_part_idx, text_part in enumerate(text_parts):
+                    if not text_part.strip() or len(
+                        text_part.strip()
+                    ) < settings.child_min_text_length:
+                        continue
+
+                    child_results = self._llm_semantic_chunker(
+                        text=text_part,
+                        source_name=page.source_file,
+                        page_num=page.page_number,
+                        parent_id=parent_id,
+                        file_hash=file_hash,
+                        source_id=source_id,
+                        parent_idx=parent_idx,
+                        text_part_idx=text_part_idx,
+                    )
+
+                    for child_idx, (child_doc, extracted_meta) in enumerate(
+                        child_results
+                    ):
+                        child_id = make_deterministic_id(
+                            source_id,
+                            page.page_number,
+                            "child",
+                            parent_idx,
+                            text_part_idx,
+                            child_idx,
+                        )
+                        child_doc.metadata["doc_id"] = child_id
+                        child_doc.metadata["parent_id"] = parent_id
+                        child_doc.metadata["content_type"] = "semantic_text"
+                        child_doc.metadata["file_hash"] = file_hash
+                        child_doc.metadata["source_id"] = source_id
+                        child_doc.metadata.update(extracted_meta)
+
+                        all_child_chunks.append(child_doc)
+                        all_relations.append(
+                            ChunkRelation(
+                                parent_id=parent_id,
+                                child_id=child_id,
+                                parent_text=parent_doc.page_content,
+                                child_text=child_doc.page_content,
+                                child_metadata=child_doc.metadata,
+                            )
+                        )
+
+                for table_idx, (table_block, table_context) in enumerate(
+                    table_blocks
+                ):
+                    table_chunks = self._chunk_table(
+                        table_block,
+                        table_context,
+                        page.source_file,
+                        page.page_number,
+                        parent_id,
+                        file_hash,
+                        source_id,
+                        parent_idx,
+                        table_idx,
+                    )
+                    all_child_chunks.extend(table_chunks)
+
+                all_parent_chunks.append(parent_doc)
+
+        logger.info(
+            f"Chunking complete: {len(all_parent_chunks)} parents, "
+            f"{len(all_child_chunks)} children"
+        )
+        return ChunkedDocument(
+            parent_chunks=all_parent_chunks,
+            child_chunks=all_child_chunks,
+            relations=all_relations,
+        )
+
+    def _merge_page_content(self, page: ParsedPage) -> str:
+        parts = []
+        if page.text_content.strip():
+            parts.append(page.text_content)
+        if page.vlm_content.strip():
+            parts.append(f"\n[VLM-OCR]\n{page.vlm_content}\n[/VLM-OCR]")
+        return "\n\n".join(parts)
+
+    def _split_tables_and_text(
+        self, text: str
+    ) -> tuple[list[tuple[str, str]], list[str]]:
+        """Separate [TABLE]...[/TABLE] blocks from prose text."""
+        table_blocks: list[tuple[str, str]] = []
+        text_parts: list[str] = []
+
+        table_pattern = re.compile(
+            r"\[TABLE[^\]]*\]\n(.*?)\n\[/TABLE\]", re.DOTALL
+        )
+
+        last_end = 0
+        for match in table_pattern.finditer(text):
+            before = text[last_end : match.start()].strip()
+            if before:
+                text_parts.append(before)
+
+            context_start = max(0, match.start() - 200)
+            table_context = text[context_start : match.start()].strip()
+            table_blocks.append((match.group(1), table_context))
+            last_end = match.end()
+
+        remaining = text[last_end:].strip()
+        if remaining:
+            text_parts.append(remaining)
+
+        if not table_blocks and not text_parts:
+            text_parts.append(text)
+
+        return table_blocks, text_parts
+
+    @staticmethod
+    def _find_end_index(remaining: str, last_few_words: str) -> int:
+        """Find the end index of last_few_words within remaining."""
+        search_bound = min(
+            len(remaining),
+            int(len(remaining) * 0.85) + len(last_few_words),
+        )
+
+        matcher = SequenceMatcher(
+            None, remaining.lower(), last_few_words.lower(), autojunk=False
+        )
+        match = matcher.find_longest_match(0, search_bound, 0, len(last_few_words))
+
+        if match.size > len(last_few_words) * 0.6:
+            return match.a + match.size
+        return -1
+
+    def _llm_semantic_chunker(
+        self,
+        text: str,
+        source_name: str,
+        page_num: int,
+        parent_id: str,
+        file_hash: str = "",
+        source_id: str = "",
+        parent_idx: int = 0,
+        text_part_idx: int = 0,
+    ) -> list[tuple[Document, dict]]:
+        """Iteratively extracts semantic chunks using the LLM."""
+        chunks: list[tuple[Document, dict]] = []
+        remaining_text = text.strip()
+        chunk_index = 0
+        max_iterations = settings.child_max_iterations
+
+        while (
+            remaining_text
+            and len(remaining_text.strip()) > settings.child_min_text_length
+            and chunk_index < max_iterations
+        ):
+            before_len = len(remaining_text)
+
+            message = HumanMessage(
+                content=f"Text to process:\n\n{remaining_text}"
+            )
+
+            try:
+                response = self.llm.invoke(
+                    [SystemMessage(content=CHUNKER_SYSTEM_PROMPT), message]
+                )
+
+                raw = extract_json(response.content)
+                data = json.loads(raw)
+
+                chunk_text = data.get("chunk_text", "").strip()
+                last_few_words = data.get("last_few_words", "").strip()
+                dynamic_metadata = data.get("metadata", {})
+
+                if not chunk_text or not last_few_words:
+                    logger.warning(
+                        "LLM chunker returned empty chunk/words. Breaking."
+                    )
+                    break
+
+                end_idx = self._find_end_index(remaining_text, last_few_words)
+
+                if end_idx != -1:
+                    extracted = remaining_text[:end_idx].strip()
+                    remaining_text = remaining_text[end_idx:].strip()
+                else:
+                    prefix = chunk_text[:30]
+                    pos = remaining_text.find(prefix)
+                    if pos != -1:
+                        end_pos = pos + len(chunk_text)
+                        extracted = remaining_text[pos:end_pos].strip()
+                        remaining_text = remaining_text[end_pos:].strip()
+                    else:
+                        logger.warning(
+                            "Chunker cannot locate boundary. Breaking."
+                        )
+                        break
+
+                if len(remaining_text) >= before_len:
+                    logger.warning(
+                        "Chunker made no progress; stopping to avoid duplication."
+                    )
+                    break
+
+                meta = {
+                    "source_file": source_name,
+                    "page": page_num,
+                    "chunk_index": chunk_index,
+                    "parent_id": parent_id,
+                }
+
+                doc = Document(page_content=extracted, metadata=meta)
+                chunks.append((doc, dynamic_metadata))
+                chunk_index += 1
+
+            except json.JSONDecodeError as e:
+                logger.error(f"LLM Chunker JSON decode error: {e}. Breaking.")
+                break
+            except Exception as e:
+                logger.error(f"LLM Chunker error: {e}. Breaking.")
+                break
+
+        if remaining_text and len(remaining_text.strip()) > 20:
+            meta = {
+                "source_file": source_name,
+                "page": page_num,
+                "chunk_index": chunk_index,
+                "parent_id": parent_id,
+                "content_type": "text_overflow",
+            }
+            doc = Document(page_content=remaining_text.strip(), metadata=meta)
+            chunks.append(
+                (doc, {"topic": "overflow", "content_type": "overflow"})
+            )
+
+        return chunks
+
+    def _chunk_table(
+        self,
+        table_text: str,
+        table_context: str,
+        source_name: str,
+        page_num: int,
+        parent_id: str,
+        file_hash: str = "",
+        source_id: str = "",
+        parent_idx: int = 0,
+        table_idx: int = 0,
+    ) -> list[Document]:
+        """Programmatic row-level table chunking."""
+        lines = table_text.strip().split("\n")
+        if len(lines) < 2:
+            return []
+
+        header_line = lines[0]
+        separator_idx = -1
+        for i, line in enumerate(lines[1:], start=1):
+            if set(line.replace("|", "").strip()) <= {"-", ":", " "}:
+                separator_idx = i
+                break
+
+        if separator_idx == -1:
+            header = header_line
+            data_lines = lines[1:]
+        else:
+            header = header_line
+            data_lines = lines[separator_idx + 1 :]
+
+        num_cols = len([c for c in header.strip("|").split("|") if c.strip()])
+        separator = "| " + " | ".join(["---"] * num_cols) + " |"
+
+        rows_per_chunk = 3
+        chunks: list[Document] = []
+
+        for i in range(0, len(data_lines), rows_per_chunk):
+            chunk_rows = data_lines[i : i + rows_per_chunk]
+            chunk_text = f"{header}\n{separator}\n" + "\n".join(chunk_rows)
+
+            if table_context:
+                chunk_text = f"Context: {table_context}\n\n{chunk_text}"
+
+            child_id = make_deterministic_id(
+                source_id, page_num, "table", parent_idx, table_idx, i
+            )
+            doc = Document(
+                page_content=chunk_text,
+                metadata={
+                    "doc_id": child_id,
+                    "parent_id": parent_id,
+                    "source_file": source_name,
+                    "page": page_num,
+                    "content_type": "table_row_chunk",
+                    "table_row_start": i,
+                    "table_row_end": min(i + rows_per_chunk, len(data_lines)),
+                    "file_hash": file_hash,
+                    "source_id": source_id,
+                },
+            )
+            chunks.append(doc)
+
+        return chunks
+```
+
+---
+
+## `storage/parent_store.py` — Add `source_id` column + `delete_by_source_id`
+
+```python
+# storage/parent_store.py
+"""
+SQLite-backed persistent store for parent chunks.
+
+Now includes source_id for stable document identity.
+Deletion by source_id ensures old versions are removed
+even when file content (and thus file_hash) changes.
+"""
+
+import json
+import logging
+from typing import Optional
+from pathlib import Path
+
+from langchain_core.documents import Document
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class ParentDocumentStore:
+    """SQLite-backed store for parent chunks. Persists across restarts."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        import sqlite3
+
+        self.db_path = db_path or str(settings.db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_table()
+        self._cache: dict[str, Document] = {}
+        self._cache_loaded = False
+
+    def _ensure_table(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS parent_chunks (
+                doc_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                source_file TEXT,
+                page INTEGER,
+                content_type TEXT,
+                text TEXT NOT NULL,
+                metadata_json TEXT,
+                file_hash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Add source_id column if migrating from older schema
+        try:
+            self.conn.execute("ALTER TABLE parent_chunks ADD COLUMN source_id TEXT")
+        except Exception:
+            pass  # Column already exists
+
+        # Index for fast deletion by source_id
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parent_source_id "
+            "ON parent_chunks(source_id)"
+        )
+        self.conn.commit()
+
+    def _load_cache(self):
+        if self._cache_loaded:
+            return
+
+        cursor = self.conn.execute(
+            "SELECT doc_id, text, source_id, source_file, page, "
+            "content_type, metadata_json "
+            "FROM parent_chunks"
+        )
+        for doc_id, text, source_id, source, page, ctype, meta_json in cursor:
+            metadata: dict = {}
+            if source_id:
+                metadata["source_id"] = source_id
+            if source:
+                metadata["source_file"] = source
+            if page is not None:
+                metadata["page"] = page
+            if ctype:
+                metadata["content_type"] = ctype
+            if meta_json:
+                try:
+                    metadata.update(json.loads(meta_json))
+                except json.JSONDecodeError:
+                    pass
+            metadata["doc_id"] = doc_id
+            self._cache[doc_id] = Document(
+                page_content=text, metadata=metadata
+            )
+
+        self._cache_loaded = True
+        logger.info(f"Parent store cache: {len(self._cache)} documents loaded")
+
+    def add_documents(self, documents: list[Document]) -> None:
+        """Store parent chunks in SQLite."""
+        for doc in documents:
+            parent_id = doc.metadata.get("doc_id")
+            if not parent_id:
+                logger.warning("Parent document missing doc_id, skipping.")
+                continue
+
+            source_id = doc.metadata.get("source_id", "")
+            source = doc.metadata.get("source_file", "")
+            page = doc.metadata.get("page")
+            ctype = doc.metadata.get("content_type", "parent")
+            file_hash = doc.metadata.get("file_hash", "")
+
+            extra_meta = {
+                k: v
+                for k, v in doc.metadata.items()
+                if k
+                not in {
+                    "doc_id",
+                    "source_id",
+                    "source_file",
+                    "page",
+                    "content_type",
+                    "file_hash",
+                }
+                and isinstance(v, (str, int, float, bool))
+            }
+
+            self.conn.execute(
+                """INSERT OR REPLACE INTO parent_chunks
+                   (doc_id, source_id, source_file, page, content_type,
+                    text, metadata_json, file_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    parent_id,
+                    source_id,
+                    source,
+                    page,
+                    ctype,
+                    doc.page_content,
+                    json.dumps(extra_meta),
+                    file_hash,
+                ),
+            )
+            self._cache[parent_id] = doc
+
+        self.conn.commit()
+        logger.info(f"Stored {len(documents)} parent chunks in SQLite")
+
+    def get_parent(self, parent_id: str) -> Optional[Document]:
+        self._load_cache()
+        return self._cache.get(parent_id)
+
+    def get_parents(self, parent_ids: list[str]) -> list[Document]:
+        self._load_cache()
+        return [self._cache[pid] for pid in parent_ids if pid in self._cache]
+
+    def list_all_ids(self) -> list[str]:
+        self._load_cache()
+        return list(self._cache.keys())
+
+    def delete_by_source_id(self, source_id: str) -> int:
+        """
+        Delete all parent chunks for a given source_id.
+
+        This is the primary deletion method for re-ingestion.
+        source_id is stable (absolute file path), so old versions
+        of a file are correctly removed even when content changes.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM parent_chunks WHERE source_id = ?", (source_id,)
+        )
+        self.conn.commit()
+        # Invalidate cache entries
+        self._cache = {
+            k: v
+            for k, v in self._cache.items()
+            if v.metadata.get("source_id") != source_id
+        }
+        return cursor.rowcount
+
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """Delete by file_hash. Kept for backward compatibility."""
+        cursor = self.conn.execute(
+            "DELETE FROM parent_chunks WHERE file_hash = ?", (file_hash,)
+        )
+        self.conn.commit()
+        self._cache = {
+            k: v
+            for k, v in self._cache.items()
+            if v.metadata.get("file_hash") != file_hash
+        }
+        return cursor.rowcount
+
+    def get_file_hash(self, source_id: str) -> Optional[str]:
+        """
+        Get the file_hash for a given source_id.
+        Used to check if re-ingestion is needed (same hash = skip).
+        """
+        cursor = self.conn.execute(
+            "SELECT file_hash FROM parent_chunks "
+            "WHERE source_id = ? LIMIT 1",
+            (source_id,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def count(self) -> int:
+        cursor = self.conn.execute("SELECT COUNT(*) FROM parent_chunks")
+        return cursor.fetchone()[0]
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+```
+
+---
+
+## `storage/bm25_store.py` — Add `source_id` column + `delete_by_source_id`
+
+```python
+# storage/bm25_store.py
+"""
+BM25 keyword index with SQLite-backed persistence.
+
+Now includes source_id for stable document identity.
+Deletion by source_id instead of file_hash.
+Deferred index build for efficient batch ingestion.
+"""
+
+import json
+import logging
+from typing import Optional
+from pathlib import Path
+
+import nltk
+from rank_bm25 import BM25Okapi
+from langchain_core.documents import Document
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+try:
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt_tab", quiet=True)
+try:
+    nltk.data.find("corpora/stopwords")
+except LookupError:
+    nltk.download("stopwords", quiet=True)
+
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+
+STOP_WORDS = set(stopwords.words("english"))
+
+
+def tokenize(text: str) -> list[str]:
+    text = text.lower()
+    tokens = word_tokenize(text)
+    return [
+        t for t in tokens if t.isalnum() and t not in STOP_WORDS and len(t) > 1
+    ]
+
+
+class BM25Store:
+    """BM25 keyword index with SQLite-backed persistence and deferred indexing."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        import sqlite3
+
+        self.db_path = db_path or str(settings.db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_table()
+
+        self.bm25: Optional[BM25Okapi] = None
+        self.doc_ids: list[str] = []
+        self.tokenized_corpus: list[list[str]] = []
+        self._index_dirty = False
+
+        self._rebuild_index()
+
+    def _ensure_table(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bm25_documents (
+                doc_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                parent_id TEXT,
+                source_file TEXT,
+                page INTEGER,
+                content_type TEXT,
+                text TEXT NOT NULL,
+                metadata_json TEXT,
+                file_hash TEXT
+            )
+            """
+        )
+        # Add source_id column if migrating from older schema
+        try:
+            self.conn.execute(
+                "ALTER TABLE bm25_documents ADD COLUMN source_id TEXT"
+            )
+        except Exception:
+            pass
+
+        # Index for fast deletion by source_id
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bm25_source_id "
+            "ON bm25_documents(source_id)"
+        )
+        self.conn.commit()
+
+    def _rebuild_index(self):
+        """Rebuild BM25 index from SQLite on startup. ORDER BY rowid for stability."""
+        cursor = self.conn.execute(
+            "SELECT doc_id, text FROM bm25_documents ORDER BY rowid"
+        )
+        rows = cursor.fetchall()
+
+        if rows:
+            self.doc_ids = []
+            self.tokenized_corpus = []
+            for doc_id, text in rows:
+                self.doc_ids.append(doc_id)
+                self.tokenized_corpus.append(tokenize(text))
+
+            self.bm25 = BM25Okapi(self.tokenized_corpus)
+            logger.info(
+                f"BM25 index rebuilt: {len(self.doc_ids)} documents from SQLite"
+            )
+        else:
+            self.doc_ids = []
+            self.tokenized_corpus = []
+            self.bm25 = None
+
+        self._index_dirty = False
+
+    def add_documents(self, documents: list[Document]) -> None:
+        """Add documents to SQLite. Does NOT rebuild index — call build_index() after."""
+        for doc in documents:
+            doc_id = doc.metadata.get("doc_id", "")
+            source_id = doc.metadata.get("source_id", "")
+            parent_id = doc.metadata.get("parent_id", "")
+            source = doc.metadata.get("source_file", "")
+            page = doc.metadata.get("page")
+            ctype = doc.metadata.get("content_type", "")
+            file_hash = doc.metadata.get("file_hash", "")
+
+            extra_meta = {
+                k: v
+                for k, v in doc.metadata.items()
+                if k
+                not in {
+                    "doc_id",
+                    "source_id",
+                    "parent_id",
+                    "source_file",
+                    "page",
+                    "content_type",
+                    "file_hash",
+                }
+                and isinstance(v, (str, int, float, bool))
+            }
+
+            self.conn.execute(
+                """INSERT OR REPLACE INTO bm25_documents
+                   (doc_id, source_id, parent_id, source_file, page,
+                    content_type, text, metadata_json, file_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    doc_id,
+                    source_id,
+                    parent_id,
+                    source,
+                    page,
+                    ctype,
+                    doc.page_content,
+                    json.dumps(extra_meta),
+                    file_hash,
+                ),
+            )
+
+        self.conn.commit()
+        self._index_dirty = True
+
+    def build_index(self) -> None:
+        """Explicitly build/rebuild the BM25 index. Call once after all add_documents()."""
+        if self._index_dirty:
+            self._rebuild_index()
+        else:
+            logger.debug("BM25 index is clean, skipping rebuild.")
+
+    def search(
+        self, query: str, top_k: int = None
+    ) -> list[tuple[Document, float]]:
+        """BM25 keyword search. Returns list of (Document, score) tuples."""
+        top_k = top_k or settings.bm25_top_k
+
+        if not self.bm25:
+            logger.warning(
+                "BM25 index is empty — was the store rebuilt after restart? "
+                "Hybrid retrieval may degrade to vector-only."
+            )
+            return []
+
+        if self._index_dirty:
+            self.build_index()
+
+        tokenized_query = tokenize(query)
+        scores = self.bm25.get_scores(tokenized_query)
+
+        scored = list(enumerate(scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:top_k]
+
+        results: list[tuple[Document, float]] = []
+        for idx, score in top:
+            if score <= 0:
+                continue
+            doc_id = self.doc_ids[idx]
+            doc = self._load_document_by_id(doc_id)
+            if doc:
+                results.append((doc, float(score)))
+
+        return results
+
+    def _load_document_by_id(self, doc_id: str) -> Optional[Document]:
+        """Load a full Document from SQLite by its doc_id (primary key)."""
+        cursor = self.conn.execute(
+            "SELECT doc_id, text, source_id, parent_id, source_file, page, "
+            "content_type, metadata_json "
+            "FROM bm25_documents WHERE doc_id = ?",
+            (doc_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        doc_id, text, source_id, parent_id, source, page, ctype, meta_json = row
+        metadata: dict = {"doc_id": doc_id}
+        if source_id:
+            metadata["source_id"] = source_id
+        if parent_id:
+            metadata["parent_id"] = parent_id
+        if source:
+            metadata["source_file"] = source
+        if page is not None:
+            metadata["page"] = page
+        if ctype:
+            metadata["content_type"] = ctype
+        if meta_json:
+            try:
+                metadata.update(json.loads(meta_json))
+            except json.JSONDecodeError:
+                pass
+
+        return Document(page_content=text, metadata=metadata)
+
+    def delete_by_source_id(self, source_id: str) -> int:
+        """
+        Delete all BM25 docs for a given source_id.
+
+        Primary deletion method for re-ingestion.
+        source_id is stable (absolute file path), so old versions
+        of a file are correctly removed even when content changes.
+
+        Marks index dirty without rebuilding — build_index() at end
+        of ingestion batch handles the rebuild.
+        """
+        cursor = self.conn.execute(
+            "DELETE FROM bm25_documents WHERE source_id = ?", (source_id,)
+        )
+        self.conn.commit()
+
+        self._index_dirty = True
+        # Invalidate in-memory structures
+        self.doc_ids = []
+        self.tokenized_corpus = []
+        self.bm25 = None
+
+        return cursor.rowcount
+
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """Delete by file_hash. Kept for backward compatibility."""
+        cursor = self.conn.execute(
+            "DELETE FROM bm25_documents WHERE file_hash = ?", (file_hash,)
+        )
+        self.conn.commit()
+
+        self._index_dirty = True
+        self.doc_ids = []
+        self.tokenized_corpus = []
+        self.bm25 = None
+
+        return cursor.rowcount
+
+    def count(self) -> int:
+        cursor = self.conn.execute("SELECT COUNT(*) FROM bm25_documents")
+        return cursor.fetchone()[0]
+
+    def clear(self) -> None:
+        self.conn.execute("DELETE FROM bm25_documents")
+        self.conn.commit()
+        self.doc_ids = []
+        self.tokenized_corpus = []
+        self.bm25 = None
+        self._index_dirty = False
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+```
+
+---
+
+## `storage/vector_store.py` — Add `delete_by_source_id` + namespace collection
+
+```python
+# storage/vector_store.py
+"""
+Qdrant vector store for child chunk embeddings.
+
+- Deterministic uuid5 IDs
+- Copy payload dict (no mutation)
+- FilterSelector for delete-by-filter
+- delete_by_source_id for stable document identity
+- Collection name namespaced by index_dir (FIX B)
+"""
+
+import logging
+from typing import Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    FilterSelector,
+)
+from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from config import settings
+from utils import make_deterministic_id
+
+logger = logging.getLogger(__name__)
+
+
+class QdrantVectorStore:
+    """Manages child chunk storage and vector search in Qdrant."""
+
+    def __init__(self):
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model=settings.embedding_model,
+            google_api_key=settings.google_api_key,
+            task_type="retrieval_document",
+        )
+
+        self.query_embeddings = GoogleGenerativeAIEmbeddings(
+            model=settings.embedding_model,
+            google_api_key=settings.google_api_key,
+            task_type="retrieval_query",
+        )
+
+        self.client = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+        )
+
+        # FIX B: Namespace collection by index_dir
+        self.collection_name = settings.qdrant_collection_name()
+        self._ensure_collection()
+
+    def _ensure_collection(self):
+        if not self.client.collection_exists(self.collection_name):
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=settings.embedding_dim,
+                    distance=Distance.COSINE,
+                ),
+            )
+            logger.info(f"Created Qdrant collection: {self.collection_name}")
+
+    def add_documents(self, documents: list[Document]) -> list[str]:
+        """Embed and store child chunks in Qdrant."""
+        if not documents:
+            return []
+
+        texts = [doc.page_content for doc in documents]
+        vectors = self.embeddings.embed_documents(texts)
+
+        points: list[PointStruct] = []
+        ids: list[str] = []
+        for doc, vector in zip(documents, vectors):
+            point_id = doc.metadata.get("doc_id") or make_deterministic_id(
+                doc.page_content
+            )
+            ids.append(point_id)
+
+            payload = {
+                "text": doc.page_content,
+                **{
+                    k: v
+                    for k, v in doc.metadata.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
+            }
+
+            points.append(
+                PointStruct(id=point_id, vector=vector, payload=payload)
+            )
+
+        batch_size = 100
+        for i in range(0, len(points), batch_size):
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points[i : i + batch_size],
+            )
+
+        logger.info(f"Added {len(points)} child chunks to Qdrant")
+        return ids
+
+    def search(
+        self,
+        query: str,
+        top_k: int = None,
+        filters: Optional[dict] = None,
+    ) -> list[tuple[Document, float]]:
+        """Vector similarity search."""
+        top_k = top_k or settings.vector_top_k
+        query_vector = self.query_embeddings.embed_query(query)
+
+        qdrant_filter = None
+        if filters:
+            conditions = [
+                FieldCondition(key=k, match=MatchValue(value=v))
+                for k, v in filters.items()
+            ]
+            qdrant_filter = Filter(must=conditions)
+
+        results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=query_vector,
+            limit=top_k,
+            query_filter=qdrant_filter,
+            with_payload=True,
+        )
+
+        documents_with_scores: list[tuple[Document, float]] = []
+        for hit in results:
+            payload = dict(hit.payload or {})
+            text = payload.pop("text", "")
+            doc = Document(page_content=text, metadata=payload)
+            documents_with_scores.append((doc, hit.score))
+
+        return documents_with_scores
+
+    def delete_by_source_id(self, source_id: str) -> int:
+        """
+        Delete all child chunks for a given source_id.
+
+        Primary deletion method for re-ingestion.
+        source_id is stable (absolute file path), so old versions
+        are correctly removed even when file content changes.
+        """
+        try:
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="source_id",
+                                match=MatchValue(value=source_id),
+                            )
+                        ]
+                    )
+                ),
+                wait=True,
+            )
+            logger.info(
+                f"Deleted Qdrant points for source_id={source_id[:50]}..."
+            )
+            return 1
+        except Exception as e:
+            logger.warning(f"Failed to delete Qdrant points by source_id: {e}")
+            return 0
+
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """Delete by file_hash. Kept for backward compatibility."""
+        try:
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=FilterSelector(
+                    filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="file_hash",
+                                match=MatchValue(value=file_hash),
+                            )
+                        ]
+                    )
+                ),
+                wait=True,
+            )
+            logger.info(
+                f"Deleted Qdrant points for file_hash={file_hash[:12]}..."
+            )
+            return 1
+        except Exception as e:
+            logger.warning(f"Failed to delete Qdrant points: {e}")
+            return 0
+
+    def count(self) -> int:
+        try:
+            info = self.client.get_collection(self.collection_name)
+            return info.points_count or 0
+        except Exception:
+            return 0
+
+    def delete_collection(self):
+        if self.client.collection_exists(self.collection_name):
+            self.client.delete_collection(self.collection_name)
+            logger.info(f"Deleted collection: {self.collection_name}")
+```
+
+---
+
+## `pipeline.py` — source_id deletion + optional skip-unchanged + namespace
+
+```python
+# pipeline.py
+"""
+Complete Agentic RAG pipeline manager.
+
+- source_id: stable document identity for deletion (survives content changes)
+- file_hash: content version for change detection (skip if unchanged)
+- Per-file processing with own hash and source_id
+- Qdrant collection namespaced by index_dir
+- Rewire all dependents after reset()
+"""
+
+import logging
+from pathlib import Path
+from typing import Union
+
+from config import settings
+from ingestion.pdf_parser import PDFParser
+from ingestion.docx_parser import DocxParser
+from chunking.agentic_chunker import AgenticChunker
+from storage.vector_store import QdrantVectorStore
+from storage.parent_store import ParentDocumentStore
+from storage.bm25_store import BM25Store
+from retrieval.hybrid_retriever import HybridRetriever
+from retrieval.reranker import GemmaReranker
+from retrieval.parent_expander import ParentExpander
+from generation.self_rag import SelfRAG
+from agent.rag_agent import AgenticRAGAgent
+
+logger = logging.getLogger(__name__)
+
+
+class AgenticRAGPipeline:
+    """Complete Agentic RAG pipeline manager with persistent state."""
+
+    def __init__(self, index_dir: str = None):
+        if index_dir:
+            settings.index_dir = index_dir
+        settings.ensure_index_dir()
+
+        # ── Ingestion ───────────────────────────────────────────────
+        self.pdf_parser = PDFParser()
+        self.docx_parser = DocxParser()
+
+        # ── Chunking ────────────────────────────────────────────────
+        self.chunker = AgenticChunker()
+
+        # ── Storage (persistent) ────────────────────────────────────
+        self.vector_store = QdrantVectorStore()
+        self.parent_store = ParentDocumentStore()
+        self.bm25_store = BM25Store()
+
+        # ── Retrieval ───────────────────────────────────────────────
+        self.hybrid_retriever = HybridRetriever(
+            vector_store=self.vector_store,
+            bm25_store=self.bm25_store,
+        )
+        self.reranker = GemmaReranker()
+        self.parent_expander = ParentExpander(parent_store=self.parent_store)
+
+        # ── Generation ──────────────────────────────────────────────
+        self.self_rag = SelfRAG()
+
+        # ── Agent ───────────────────────────────────────────────────
+        self.agent = AgenticRAGAgent(
+            hybrid_retriever=self.hybrid_retriever,
+            reranker=self.reranker,
+            parent_expander=self.parent_expander,
+            self_rag=self.self_rag,
+        )
+
+    # ── Ingest & Index ──────────────────────────────────────────────
+
+    def ingest(self, file_paths: list[Union[str, Path]]) -> dict:
+        """
+        Ingest documents: Parse → Chunk → Store.
+
+        Key behaviors:
+        - source_id = absolute file path (stable identity)
+        - file_hash = content hash (change detection)
+        - Deletes old chunks by source_id before ingesting new version
+        - Optionally skips ingestion if file_hash is unchanged
+        - Processes each file independently
+        - Builds BM25 index once at the end
+        """
+        total_pages = 0
+        total_parents = 0
+        total_children = 0
+        files_processed = 0
+        files_skipped = 0
+        bm25_needs_build = False
+
+        for file_path in file_paths:
+            file_path = Path(file_path)
+            ext = file_path.suffix.lower()
+
+            # ── Stable document identity ────────────────────────────
+            source_id = str(file_path.resolve())
+
+            try:
+                # ── Parse per file ──────────────────────────────────
+                if ext == ".pdf":
+                    pages, fhash = self.pdf_parser.parse(file_path)
+                elif ext == ".docx":
+                    pages, fhash = self.docx_parser.parse(file_path)
+                elif ext == ".doc":
+                    logger.error(
+                        f"Legacy .doc format not supported: {file_path.name}. "
+                        f"Convert to .docx first."
+                    )
+                    continue
+                else:
+                    logger.warning(f"Unsupported file type: {ext}")
+                    continue
+
+                # ── Skip if unchanged ───────────────────────────────
+                existing_hash = self.parent_store.get_file_hash(source_id)
+                if existing_hash == fhash:
+                    logger.info(
+                        f"Skipping {file_path.name}: content unchanged "
+                        f"(hash={fhash[:12]}...)"
+                    )
+                    files_skipped += 1
+                    continue
+
+                # ── Delete old version by source_id ─────────────────
+                # This correctly removes old chunks even when the file
+                # content (and thus file_hash) has changed.
+                self._delete_existing_chunks(source_id)
+
+                # ── Chunk per file with its own hash and source_id ──
+                chunked = self.chunker.chunk_document(pages, fhash, source_id)
+
+                # ── Store ───────────────────────────────────────────
+                self.parent_store.add_documents(chunked.parent_chunks)
+                self.vector_store.add_documents(chunked.child_chunks)
+                self.bm25_store.add_documents(chunked.child_chunks)
+                bm25_needs_build = True
+
+                total_pages += len(pages)
+                total_parents += len(chunked.parent_chunks)
+                total_children += len(chunked.child_chunks)
+                files_processed += 1
+
+                logger.info(
+                    f"Ingested {file_path.name}: "
+                    f"{len(pages)} pages, {len(chunked.parent_chunks)} parents, "
+                    f"{len(chunked.child_chunks)} children "
+                    f"(source_id={source_id[:50]}...)"
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to ingest {file_path}: {e}")
+                continue
+
+        # Build BM25 index once after all files are ingested
+        if bm25_needs_build:
+            self.bm25_store.build_index()
+
+        stats = {
+            "files_processed": files_processed,
+            "files_skipped": files_skipped,
+            "total_pages": total_pages,
+            "parent_chunks": total_parents,
+            "child_chunks": total_children,
+        }
+
+        logger.info(f"Ingestion complete: {stats}")
+        return stats
+
+    def _delete_existing_chunks(self, source_id: str) -> None:
+        """
+        Remove old chunks for a source_id before re-ingestion.
+
+        Uses source_id (stable file path) instead of file_hash
+        so that updated files with different content hashes
+        still correctly remove their old versions.
+        """
+        deleted_parents = self.parent_store.delete_by_source_id(source_id)
+        deleted_bm25 = self.bm25_store.delete_by_source_id(source_id)
+        deleted_vector = self.vector_store.delete_by_source_id(source_id)
+        if deleted_parents > 0 or deleted_bm25 > 0 or deleted_vector > 0:
+            logger.info(
+                f"Removed old chunks for source_id={source_id[:50]}...: "
+                f"{deleted_parents} parents, {deleted_bm25} BM25, "
+                f"{deleted_vector} vector"
+            )
+
+    # ── Query ───────────────────────────────────────────────────────
+
+    def query(self, question: str) -> dict:
+        return self.agent.invoke(question)
+
+    # ── Status ──────────────────────────────────────────────────────
+
+    def status(self) -> dict:
+        """Get current index status."""
+        return {
+            "qdrant_points": self.vector_store.count(),
+            "parent_chunks": self.parent_store.count(),
+            "bm25_documents": self.bm25_store.count(),
+            "collection_name": self.vector_store.collection_name,
+            "index_dir": settings.index_dir,
+        }
+
+    # ── Reset ───────────────────────────────────────────────────────
+
+    def reset(self):
+        """Reset all stores AND rewire all dependents."""
+        self.vector_store.delete_collection()
+        self.vector_store._ensure_collection()
+
+        self.parent_store.close()
+        self.bm25_store.close()
+        if settings.db_path.exists():
+            settings.db_path.unlink()
+
+        self.parent_store = ParentDocumentStore()
+        self.bm25_store = BM25Store()
+
+        # Rewire ALL dependents
+        self.hybrid_retriever = HybridRetriever(
+            self.vector_store, self.bm25_store
+        )
+        self.parent_expander = ParentExpander(self.parent_store)
+        self.agent = AgenticRAGAgent(
+            hybrid_retriever=self.hybrid_retriever,
+            reranker=self.reranker,
+            parent_expander=self.parent_expander,
+            self_rag=self.self_rag,
+        )
+
+        logger.info("Pipeline reset complete — all stores and dependents rewired")
+
+    def close(self):
+        """Close all connections."""
+        self.parent_store.close()
+        self.bm25_store.close()
+```
+
+---
+
+## `main.py` — Updated status display
+
+Only the `cmd_status` function changes to show the new fields.
+
+```python
+def cmd_status(args):
+    pipeline = get_pipeline(args.index_dir)
+    status = pipeline.status()
+
+    print("\n📊 Index Status")
+    print(f"   Index dir:       {status['index_dir']}")
+    print(f"   Qdrant collection: {status['collection_name']}")
+    print(f"   Qdrant points:   {status['qdrant_points']}")
+    print(f"   Parent chunks:   {status['parent_chunks']}")
+    print(f"   BM25 documents:  {status['bm25_documents']}")
+
+    if status["qdrant_points"] == 0:
+        print(
+            "\n   ⚠️  Index is empty. Run `python main.py ingest --files ...` first."
+        )
+    elif status["parent_chunks"] == 0 or status["bm25_documents"] == 0:
+        print(
+            "\n   ⚠️  Index is partial. Some stores are empty (persistence issue?)."
+        )
+
+    pipeline.close()
+```
+
+---
+
+## Verification: Deletion Lifecycle
+
+```
+SCENARIO 1: First ingestion of /docs/manual.pdf
+─────────────────────────────────────────────────
+  source_id = "/docs/manual.pdf"        (absolute path)
+  file_hash = "a1b2c3d4..."            (content hash)
+
+  1. get_file_hash(source_id) → None    (no previous version)
+  2. _delete_existing_chunks(source_id) → 0 deleted
+  3. chunk_document(pages, file_hash, source_id)
+  4. Store all chunks with source_id + file_hash
+
+  Result: New chunks stored ✅
+
+
+SCENARIO 2: Re-ingest same file, content UNCHANGED
+───────────────────────────────────────────────────
+  source_id = "/docs/manual.pdf"        (same)
+  file_hash = "a1b2c3d4..."            (same)
+
+  1. get_file_hash(source_id) → "a1b2c3d4..."
+  2. existing_hash == file_hash → True
+  3. SKIP ingestion
+
+  Result: No wasted work ✅
+
+
+SCENARIO 3: Re-ingest same file, content CHANGED
+─────────────────────────────────────────────────
+  source_id = "/docs/manual.pdf"        (same — stable identity)
+  file_hash = "e5f6g7h8..."            (different — new content)
+
+  1. get_file_hash(source_id) → "a1b2c3d4..."
+  2. existing_hash != file_hash → proceed
+  3. _delete_existing_chunks(source_id)
+     → DELETE FROM parent_chunks WHERE source_id = '/docs/manual.pdf'
+     → DELETE FROM bm25_documents WHERE source_id = '/docs/manual.pdf'
+     → Qdrant delete where source_id = '/docs/manual.pdf'
+     ✅ All old chunks removed regardless of their file_hash
+  4. chunk_document(pages, new_file_hash, source_id)
+  5. Store new chunks with updated file_hash
+
+  Result: Old version completely removed, new version stored ✅
+
+
+SCENARIO 4: Different index_dir, same Qdrant instance
+──────────────────────────────────────────────────────
+  Run A: --index-dir ./project_alpha
+    → Qdrant collection: "agentic_rag_child_1a2b3c4d"
+    → SQLite: ./project_alpha/agentic_rag.db
+
+  Run B: --index-dir ./project_beta
+    → Qdrant collection: "agentic_rag_child_5e6f7g8h"
+    → SQLite: ./project_beta/agentic_rag.db
+
+  Result: Completely independent indexes, no cross-contamination ✅
+```
+
+---
+
+## Complete Fix Summary
+
+| # | Issue | File(s) | Fix |
+|---|---|---|---|
+| A1 | No `source_id` — deletion by `file_hash` fails on content change | `chunker`, `parent_store`, `bm25_store`, `vector_store`, `pipeline` | `source_id = str(Path(file_path).resolve())` stored in all metadata; `delete_by_source_id()` methods on all stores |
+| A2 | Skip re-ingestion when file unchanged | `pipeline.py`, `parent_store.py` | `get_file_hash(source_id)` check before parsing; skip if hash matches |
+| B1 | Qdrant collection not namespaced by `index_dir` | `config.py`, `vector_store.py` | `settings.qdrant_collection_name()` derives name from `index_dir` hash |
+| 1 | `_check_relevance` no max_retries guard | `rag_agent.py` | Guard added (from previous round, included in full file above) |
+| 2 | `grade_usefulness` default score=3 silently passes | `self_rag.py` | Default changed to 1 (from previous round) |
+| 3 | Batch reranker truncation tight at 8192 | `reranker.py` | Adaptive truncation (from previous round) |
+| 4 | Unused `file_hash` param in `_parse_page` | `pdf_parser.py` | Removed (from previous round) |
+| 5 | `delete_by_file_hash` triggers rebuild mid-ingestion | `bm25_store.py` | Marks dirty only, no rebuild (from previous round) |
+| 6 | Greedy `extract_json` regex | `utils.py` | Balanced-brace scanning (from previous round) |

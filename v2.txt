@@ -1,0 +1,3154 @@
+# Complete Corrected Implementation — All Fixes Applied
+
+## Fix Summary
+
+| # | Issue | Fix |
+|---|---|---|
+| 1 | `difflib.get_close_matches` on raw string | Replaced with `SequenceMatcher.find_longest_match` + progress guard |
+| 2 | Negative hash → Qdrant 400 | Deterministic `uuid5` IDs |
+| 3 | `reset()` leaves collection deleted | Re-create collection after deletion |
+| 4 | No-retrieval path → infinite retry | Separate generation modes, skip support grading |
+| 5 | Table separator column count | Count cells not pipes |
+| 6 | Missing deps | Added `pandas`, `tabulate`, `langchain-text-splitters` |
+| 7 | BM25/Parent not persistent | SQLite-backed stores |
+| 8 | API failures silently pass docs | Failure counter + warning |
+| 9 | Parent expander drops second child | Track max score per parent |
+| 10 | `state["max_retries"]` unused | Read from state |
+| 11 | DOCX page_number=1 + out-of-order | In-order body iteration, page estimation |
+| 12 | ~25 LLM calls/query | Batch relevance grading |
+| 13 | No rate-limit handling | Exponential backoff |
+| 14 | `payload.pop()` mutates response | Copy payload dict |
+| 15 | Fragile code-fence stripping | Centralized `_extract_json` with regex |
+| 16 | Revalidation ignored | Add conditional routing |
+| 17 | CLI ingest/query don't share state | Persistent SQLite + shared index dir |
+| 18 | PARTIALLY_SUPPORTED too permissive | Strict by default, config flag |
+| 19 | VLM OCR on every page | Smart: skip if text density high |
+| 20 | `.doc` files not supported | Guard + convert message |
+
+---
+
+## requirements.txt
+
+```txt
+# requirements.txt
+google-generativeai>=0.8.0
+langchain-google-genai>=2.0.0
+langchain-ollama>=0.2.0
+langchain-core>=0.3.0
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
+qdrant-client>=1.11.0
+pymupdf>=1.24.0
+python-docx>=1.1.0
+rank-bm25>=0.2.2
+nltk>=3.8
+pandas>=2.0
+tabulate>=0.9
+pydantic>=2.0
+pydantic-settings>=2.0
+pillow>=10.0
+python-dotenv>=1.0
+google-api-core>=2.0
+```
+
+---
+
+## config.py
+
+```python
+# config.py
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from typing import Optional
+from pathlib import Path
+
+
+class Settings(BaseSettings):
+    """Central configuration for the Agentic RAG system."""
+
+    # ── API Keys & Endpoints ────────────────────────────────────────
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
+    qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
+    qdrant_api_key: Optional[str] = Field(default=None, alias="QDRANT_API_KEY")
+
+    # ── Models ──────────────────────────────────────────────────────
+    llm_model: str = "gemini-2.0-flash-lite"
+    embedding_model: str = "models/text-embedding-004"
+    embedding_dim: int = 768
+    reranker_model: str = "gemma4:26b"
+
+    # ── Persistence ─────────────────────────────────────────────────
+    index_dir: str = Field(default="./index_data", alias="INDEX_DIR")
+
+    # ── Qdrant ──────────────────────────────────────────────────────
+    qdrant_collection_child: str = "agentic_rag_child"
+
+    # ── Chunking ────────────────────────────────────────────────────
+    parent_chunk_size: int = 1500
+    parent_chunk_overlap: int = 200
+    child_max_iterations: int = 25
+    child_min_text_length: int = 50
+
+    # ── Retrieval ───────────────────────────────────────────────────
+    vector_top_k: int = 10
+    bm25_top_k: int = 10
+    rerank_top_k: int = 5
+    rrf_k: int = 60
+
+    # ── Self-RAG ────────────────────────────────────────────────────
+    max_retries: int = 3
+    relevance_threshold: float = 0.6
+    support_threshold: float = 0.6
+    usefulness_min_score: int = 3
+    strict_support: bool = True  # FIX #18: PARTIALLY_SUPPORTED fails by default
+
+    # ── VLM OCR ────────────────────────────────────────────────────
+    vlm_image_dpi: int = 200
+    vlm_max_images_per_page: int = 5
+    vlm_text_density_threshold: int = 500  # FIX #19: skip VLM if chars > this
+    vlm_rate_limit_retries: int = 5        # FIX #13: backoff retries
+
+    # ── PDF ─────────────────────────────────────────────────────────
+    pdf_text_density_threshold: int = 500
+
+    # ── DOCX ────────────────────────────────────────────────────────
+    docx_chars_per_page: int = 3000  # FIX #11: for page estimation
+
+    @property
+    def db_path(self) -> Path:
+        return Path(self.index_dir) / "agentic_rag.db"
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
+
+
+settings = Settings()
+```
+
+---
+
+## utils.py (NEW — centralized helpers)
+
+```python
+# utils.py
+"""
+Shared utilities used across the Agentic RAG system.
+"""
+
+import re
+import uuid
+import time
+import hashlib
+import logging
+from pathlib import Path
+from typing import Optional
+
+from google.api_core.exceptions import ResourceExhausted
+
+logger = logging.getLogger(__name__)
+
+
+# ── JSON Extraction ─────────────────────────────────────────────────
+# FIX #15: Centralized, robust code-fence stripping
+
+def extract_json(raw: str) -> str:
+    """
+    Strip markdown code fences and return the first JSON-looking block.
+    Handles ```json...```, ```...```, and bare JSON.
+    """
+    # Match ```json ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    if fence_match:
+        return fence_match.group(1).strip()
+    # Try to find bare JSON object or array
+    json_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw)
+    if json_match:
+        return json_match.group(1).strip()
+    return raw.strip()
+
+
+# ── Deterministic IDs ──────────────────────────────────────────────
+# FIX #2: Avoid negative hash; use uuid5 for determinism
+
+NAMESPACE_DOC = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # custom namespace
+
+
+def make_deterministic_id(*parts: str) -> str:
+    """
+    Generate a deterministic UUID5 from the given string parts.
+    Same input always produces the same UUID.
+    """
+    seed = ":".join(str(p) for p in parts)
+    return str(uuid.uuid5(NAMESPACE_DOC, seed))
+
+
+# ── File Hashing ───────────────────────────────────────────────────
+# For deduplication on re-ingestion
+
+def compute_file_hash(file_path: str | Path) -> str:
+    """Compute SHA-256 hash of a file for deduplication."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+# ── Rate-Limited Gemini Call ───────────────────────────────────────
+# FIX #13: Exponential backoff for Gemini API rate limits
+
+def rate_limited_generate(
+    model,
+    contents,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+) -> Optional[str]:
+    """
+    Call Gemini generate_content with exponential backoff on rate limits.
+    """
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(contents)
+            return response.text
+        except ResourceExhausted as e:
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"Gemini rate limited (attempt {attempt + 1}/{max_retries}), "
+                f"retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+        except Exception as e:
+            logger.error(f"Gemini generation error: {e}")
+            return None
+    logger.error(f"Max retries ({max_retries}) exceeded for Gemini call")
+    return None
+```
+
+---
+
+## ingestion/pdf_parser.py
+
+```python
+# ingestion/pdf_parser.py
+"""
+PyMuPDF + Gemini VLM for PDF ingestion.
+
+FIX #19: Smart VLM — skip full-page OCR when native text is sufficient.
+FIX #13: Rate-limit backoff on Gemini VLM calls.
+FIX: try/finally around fitz.open().
+"""
+
+import base64
+import io
+import logging
+from pathlib import Path
+from dataclasses import dataclass
+
+import google.generativeai as genai
+from PIL import Image
+
+from config import settings
+from utils import rate_limited_generate, compute_file_hash
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ParsedPage:
+    """Represents a single parsed page with text + VLM enrichment."""
+    page_number: int
+    text_content: str
+    vlm_content: str
+    images: list[str]  # base64-encoded page images
+    source_file: str
+
+
+VLM_OCR_PROMPT = """You are an expert document OCR and analysis agent.
+Analyze this document page image and extract ALL information:
+
+1. **OCR Text**: Extract all visible text verbatim, preserving structure.
+2. **Tables**: Describe tables in markdown format with all rows/columns.
+3. **Figures/Charts**: Describe any figures, charts, or diagrams in detail.
+4. **Layout**: Note headers, footers, sidebars, and callout boxes.
+
+Rules:
+- Do NOT summarize. Extract verbatim.
+- If text is unclear, make your best attempt and mark with [?].
+- Preserve the reading order and document hierarchy.
+- For mathematical formulas, use LaTeX notation.
+"""
+
+IMAGE_DESC_PROMPT = """Describe this image from a document in detail.
+If it contains a chart or graph, describe all data points and labels.
+If it's a diagram, describe all components and connections."""
+
+
+class PDFParser:
+    """PDF parser combining PyMuPDF text extraction with Gemini VLM OCR."""
+
+    def __init__(self):
+        genai.configure(api_key=settings.gemini_api_key)
+        self.vlm_model = genai.GenerativeModel(
+            model_name=settings.llm_model,
+            generation_config=genai.GenerationConfig(temperature=0.0)
+        )
+
+    def parse(self, file_path: str | Path) -> tuple[list[ParsedPage], str]:
+        """
+        Parse a PDF file into ParsedPage objects.
+        Returns: (pages, file_hash)
+        """
+        file_path = Path(file_path)
+        file_hash = compute_file_hash(file_path)
+        pages = []
+
+        doc = fitz.open(str(file_path))  # FIX: ensure close via finally
+        try:
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_data = self._parse_page(page, page_num, file_path.name, file_hash)
+                pages.append(page_data)
+        finally:
+            doc.close()
+
+        logger.info(f"Parsed {len(pages)} pages from {file_path.name}")
+        return pages, file_hash
+
+    def _parse_page(
+        self, page, page_num: int, source_name: str, file_hash: str
+    ) -> ParsedPage:
+        """Parse a single PDF page."""
+
+        # ── 1. Direct text extraction ───────────────────────────────
+        text_content = page.get_text("text")
+
+        # ── 2. Extract tables (PyMuPDF built-in) ───────────────────
+        tables = page.find_tables()
+        table_texts = []
+        for table in tables:
+            try:
+                df = table.to_pandas()
+                table_texts.append(f"\n[TABLE]\n{df.to_markdown()}\n[/TABLE]\n")
+            except Exception:
+                pass
+
+        if table_texts:
+            text_content += "\n" + "\n".join(table_texts)
+
+        # ── 3. Smart VLM: only OCR if text density is low ──────────
+        # FIX #19: Skip expensive VLM on pages with plenty of native text
+        page_images = []
+        vlm_content = ""
+
+        text_density = len(text_content.strip())
+
+        if text_density < settings.vlm_text_density_threshold:
+            # Page has little text — likely scanned or image-heavy
+            page_images = self._render_page_images(page, page_num)
+            if page_images:
+                vlm_content = rate_limited_generate(
+                    self.vlm_model,
+                    [VLM_OCR_PROMPT, self._b64_to_pil(page_images[0])],
+                    max_retries=settings.vlm_rate_limit_retries,
+                ) or ""
+        else:
+            logger.debug(
+                f"Page {page_num + 1}: text density={text_density}, "
+                f"skipping full-page VLM OCR"
+            )
+
+        # ── 4. Extract embedded images for VLM description ─────────
+        # Always describe embedded images regardless of text density
+        embedded_descriptions = self._describe_embedded_images(page, page_num)
+        if embedded_descriptions:
+            vlm_content = (vlm_content + "\n\n" + embedded_descriptions).strip()
+
+        return ParsedPage(
+            page_number=page_num + 1,
+            text_content=text_content.strip(),
+            vlm_content=vlm_content.strip(),
+            images=page_images,
+            source_file=source_name,
+        )
+
+    def _render_page_images(self, page, page_num: int) -> list[str]:
+        """Render a PDF page as a base64-encoded PNG."""
+        try:
+            mat = fitz.Matrix(settings.vlm_image_dpi / 72, settings.vlm_image_dpi / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            return [base64.b64encode(img_bytes).decode("utf-8")]
+        except Exception as e:
+            logger.warning(f"Failed to render page {page_num}: {e}")
+            return []
+
+    @staticmethod
+    def _b64_to_pil(image_b64: str) -> Image.Image:
+        """Convert base64 string to PIL Image."""
+        return Image.open(io.BytesIO(base64.b64decode(image_b64)))
+
+    def _describe_embedded_images(self, page, page_num: int) -> str:
+        """Extract and describe embedded images with VLM."""
+        descriptions = []
+        image_list = page.get_images(full=True)
+
+        for img_idx, img_info in enumerate(
+            image_list[:settings.vlm_max_images_per_page]
+        ):
+            try:
+                xref = img_info[0]
+                base_image = page.parent.extract_image(xref)
+                image_bytes = base_image["image"]
+                image = Image.open(io.BytesIO(image_bytes))
+
+                desc = rate_limited_generate(
+                    self.vlm_model,
+                    [IMAGE_DESC_PROMPT, image],
+                    max_retries=settings.vlm_rate_limit_retries,
+                )
+                if desc:
+                    descriptions.append(f"[IMAGE {img_idx + 1}]: {desc}")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to describe image {img_idx} on page {page_num}: {e}"
+                )
+
+        return "\n\n".join(descriptions)
+
+
+# FIX: import fitz at the top
+import fitz
+```
+
+---
+
+## ingestion/docx_parser.py
+
+```python
+# ingestion/docx_parser.py
+"""
+python-docx + Gemini VLM for DOCX ingestion.
+
+FIX #11: In-order body element iteration (paragraphs + tables interleaved).
+FIX #11: Estimated page numbers based on accumulated content length.
+FIX #20: Guard against .doc files (python-docx only supports .docx).
+FIX #13: Rate-limit backoff on VLM calls.
+"""
+
+import base64
+import io
+import logging
+from pathlib import Path
+from dataclasses import dataclass
+
+import google.generativeai as genai
+from docx import Document
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+from docx.table import Table as DocxTable
+from PIL import Image
+
+from config import settings
+from utils import rate_limited_generate, compute_file_hash
+from .pdf_parser import ParsedPage
+
+logger = logging.getLogger(__name__)
+
+
+def _iter_block_items(doc: Document):
+    """
+    Iterate over document body elements in document order.
+    Yields Paragraph and Table objects as they appear.
+    """
+    parent_elm = doc.element.body
+    for child in parent_elm.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            yield DocxTable(child, doc)
+
+
+class DocxParser:
+    """DOCX parser with in-order body iteration and VLM image description."""
+
+    def __init__(self):
+        genai.configure(api_key=settings.gemini_api_key)
+        self.vlm_model = genai.GenerativeModel(
+            model_name=settings.llm_model,
+            generation_config=genai.GenerationConfig(temperature=0.0)
+        )
+
+    def parse(self, file_path: str | Path) -> tuple[list[ParsedPage], str]:
+        """
+        Parse a DOCX file into ParsedPage objects.
+        Returns: (pages, file_hash)
+
+        FIX #20: Reject .doc files.
+        """
+        file_path = Path(file_path)
+
+        if file_path.suffix.lower() == ".doc":
+            raise ValueError(
+                f"Legacy .doc format is not supported: {file_path.name}. "
+                f"Convert to .docx using LibreOffice: "
+                f"libreoffice --headless --convert-to docx {file_path}"
+            )
+
+        file_hash = compute_file_hash(file_path)
+        doc = Document(str(file_path))
+
+        pages = []
+        current_text_parts = []
+        current_char_count = 0
+        page_counter = 1
+        chars_per_page = settings.docx_chars_per_page
+
+        # ── Iterate body elements IN ORDER ──────────────────────────
+        # FIX #11: Preserves original document order of paragraphs and tables
+        for block in _iter_block_items(doc):
+            if isinstance(block, Paragraph):
+                text = block.text.strip()
+                if not text:
+                    continue
+
+                style_name = block.style.name if block.style else ""
+                if "Heading 1" in style_name:
+                    current_text_parts.append(f"\n# {text}\n")
+                elif "Heading 2" in style_name:
+                    current_text_parts.append(f"\n## {text}\n")
+                elif "Heading 3" in style_name:
+                    current_text_parts.append(f"\n### {text}\n")
+                else:
+                    current_text_parts.append(text)
+
+                current_char_count += len(text)
+
+                # FIX #11: Estimate page breaks by accumulated character count
+                if current_char_count >= chars_per_page:
+                    combined = "\n".join(current_text_parts)
+                    if combined.strip():
+                        pages.append(ParsedPage(
+                            page_number=page_counter,
+                            text_content=combined,
+                            vlm_content="",
+                            images=[],
+                            source_file=file_path.name,
+                        ))
+                        page_counter += 1
+                    current_text_parts = []
+                    current_char_count = 0
+
+            elif isinstance(block, DocxTable):
+                table_md = self._table_to_markdown(block)
+                current_text_parts.append(
+                    f"\n[TABLE]\n{table_md}\n[/TABLE]\n"
+                )
+                current_char_count += len(table_md)
+
+        # Flush remaining content
+        if current_text_parts:
+            combined = "\n".join(current_text_parts)
+            if combined.strip():
+                pages.append(ParsedPage(
+                    page_number=page_counter,
+                    text_content=combined,
+                    vlm_content="",
+                    images=[],
+                    source_file=file_path.name,
+                ))
+
+        # ── Describe embedded images ────────────────────────────────
+        image_descriptions = self._describe_docx_images(doc)
+        if image_descriptions and pages:
+            # Append image descriptions to the last page's VLM content
+            pages[-1].vlm_content = (
+                (pages[-1].vlm_content + "\n\n" + image_descriptions).strip()
+            )
+        elif image_descriptions and not pages:
+            pages.append(ParsedPage(
+                page_number=1,
+                text_content="",
+                vlm_content=image_descriptions,
+                images=[],
+                source_file=file_path.name,
+            ))
+
+        logger.info(f"Parsed DOCX: {file_path.name} -> {len(pages)} page(s)")
+        return pages, file_hash
+
+    def _table_to_markdown(self, table: DocxTable) -> str:
+        """Convert a python-docx table to markdown format."""
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            rows.append("| " + " | ".join(cells) + " |")
+
+        if len(rows) > 1:
+            num_cols = len(table.rows[0].cells)  # FIX #5: count cells, not pipes
+            header_sep = "| " + " | ".join(["---"] * num_cols) + " |"
+            rows.insert(1, header_sep)
+
+        return "\n".join(rows)
+
+    def _describe_docx_images(self, doc: Document) -> str:
+        """Extract and describe images from DOCX with VLM."""
+        descriptions = []
+        img_idx = 0
+
+        for rel in doc.part.rels.values():
+            if "image" in rel.reltype:
+                try:
+                    image_bytes = rel.target_part.blob
+                    image = Image.open(io.BytesIO(image_bytes))
+
+                    desc = rate_limited_generate(
+                        self.vlm_model,
+                        [
+                            "Describe this image from a document in detail. "
+                            "If it contains a chart, diagram, or figure, "
+                            "describe all data points, labels, and connections.",
+                            image,
+                        ],
+                        max_retries=settings.vlm_rate_limit_retries,
+                    )
+                    if desc:
+                        img_idx += 1
+                        descriptions.append(f"[IMAGE {img_idx}]: {desc}")
+                except Exception as e:
+                    logger.warning(f"Failed to describe DOCX image: {e}")
+
+        return "\n\n".join(descriptions)
+```
+
+---
+
+## chunking/agentic_chunker.py
+
+```python
+# chunking/agentic_chunker.py
+"""
+LLM Agentic Chunking with Dynamic Metadata.
+
+FIX #1: Replaced difflib.get_close_matches with SequenceMatcher + progress guard.
+FIX #5: Correct table separator column count.
+FIX #2: Deterministic IDs via uuid5.
+"""
+
+import json
+import uuid
+import logging
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from config import settings
+from utils import extract_json, make_deterministic_id
+from ingestion.pdf_parser import ParsedPage
+
+logger = logging.getLogger(__name__)
+
+
+CHUNKER_SYSTEM_PROMPT = """You are an expert document chunking agent. Your task is to read the provided text and extract exactly ONE logical, self-contained semantic chunk.
+
+Rules:
+1. Extract the text VERBATIM. Do not summarize, rephrase, or omit any words.
+2. The chunk should represent one complete thought, specification, or topic.
+3. After extracting the chunk, identify the EXACT last 5-10 words of your extracted chunk.
+4. Extract meaningful metadata as key-value pairs. Do NOT use generic keys like "key1". Use specific keys like "pump_model", "material", "valve_type", "pressure_rating", "section_title", "topic", "entity_type".
+
+You MUST respond ONLY with valid JSON in this exact format:
+{
+  "chunk_text": "the verbatim text you extracted...",
+  "last_few_words": "the exact last 5 to 10 words of the chunk_text",
+  "metadata": {
+    "specific_key_1": "specific_value_1",
+    "specific_key_2": "specific_value_2"
+  }
+}
+"""
+
+
+@dataclass
+class ChunkRelation:
+    parent_id: str
+    child_id: str
+    parent_text: str
+    child_text: str
+    child_metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ChunkedDocument:
+    parent_chunks: list[Document]
+    child_chunks: list[Document]
+    relations: list[ChunkRelation]
+
+
+class AgenticChunker:
+    """
+    Two-level agentic chunker:
+    - Parent: RecursiveCharacterTextSplitter (large context)
+    - Child: LLM-driven iterative semantic extraction (precise)
+    """
+
+    def __init__(self):
+        self.llm = ChatGoogleGenerativeAI(
+            model=settings.llm_model,
+            google_api_key=settings.gemini_api_key,
+            temperature=0.0,
+            max_output_tokens=4096,
+        )
+
+        self.parent_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.parent_chunk_size,
+            chunk_overlap=settings.parent_chunk_overlap,
+            separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""],
+        )
+
+    def chunk_document(
+        self, pages: list[ParsedPage], file_hash: str
+    ) -> ChunkedDocument:
+        """
+        Chunk a full document into parent + child chunks.
+        Uses file_hash for deterministic IDs and deduplication.
+        """
+        import re
+
+        all_parent_chunks = []
+        all_child_chunks = []
+        all_relations = []
+
+        for page in pages:
+            full_text = self._merge_page_content(page)
+            if not full_text.strip():
+                continue
+
+            parent_docs = self.parent_splitter.create_documents(
+                texts=[full_text],
+                metadatas=[{
+                    "source_file": page.source_file,
+                    "page": page.page_number,
+                    "content_type": "parent",
+                    "file_hash": file_hash,
+                }]
+            )
+
+            for parent_idx, parent_doc in enumerate(parent_docs):
+                # FIX #2: Deterministic parent ID
+                parent_id = make_deterministic_id(
+                    file_hash, page.page_number, "parent", parent_idx
+                )
+                parent_doc.metadata["doc_id"] = parent_id
+
+                # Separate tables from text
+                table_blocks, text_parts = self._split_tables_and_text(
+                    parent_doc.page_content
+                )
+
+                # Process text with LLM Agentic Chunker
+                for text_part in text_parts:
+                    if not text_part.strip() or len(
+                        text_part.strip()
+                    ) < settings.child_min_text_length:
+                        continue
+
+                    child_results = self._llm_semantic_chunker(
+                        text=text_part,
+                        source_name=page.source_file,
+                        page_num=page.page_number,
+                        parent_id=parent_id,
+                        file_hash=file_hash,
+                        parent_idx=parent_idx,
+                    )
+
+                    for child_idx, (child_doc, extracted_meta) in enumerate(
+                        child_results
+                    ):
+                        child_id = make_deterministic_id(
+                            file_hash, page.page_number,
+                            "child", parent_idx, child_idx
+                        )
+                        child_doc.metadata["doc_id"] = child_id
+                        child_doc.metadata["parent_id"] = parent_id
+                        child_doc.metadata["content_type"] = "semantic_text"
+                        child_doc.metadata["file_hash"] = file_hash
+                        child_doc.metadata.update(extracted_meta)
+
+                        all_child_chunks.append(child_doc)
+                        all_relations.append(ChunkRelation(
+                            parent_id=parent_id,
+                            child_id=child_id,
+                            parent_text=parent_doc.page_content,
+                            child_text=child_doc.page_content,
+                            child_metadata=child_doc.metadata,
+                        ))
+
+                # Process tables programmatically
+                for table_idx, (table_block, table_context) in enumerate(
+                    table_blocks
+                ):
+                    table_chunks = self._chunk_table(
+                        table_block, table_context,
+                        page.source_file, page.page_number,
+                        parent_id, file_hash, parent_idx, table_idx,
+                    )
+                    all_child_chunks.extend(table_chunks)
+
+                all_parent_chunks.append(parent_doc)
+
+        logger.info(
+            f"Chunking complete: {len(all_parent_chunks)} parents, "
+            f"{len(all_child_chunks)} children"
+        )
+        return ChunkedDocument(
+            parent_chunks=all_parent_chunks,
+            child_chunks=all_child_chunks,
+            relations=all_relations,
+        )
+
+    def _merge_page_content(self, page: ParsedPage) -> str:
+        parts = []
+        if page.text_content.strip():
+            parts.append(page.text_content)
+        if page.vlm_content.strip():
+            parts.append(f"\n[VLM-OCR]\n{page.vlm_content}\n[/VLM-OCR]")
+        return "\n\n".join(parts)
+
+    def _split_tables_and_text(
+        self, text: str
+    ) -> tuple[list[tuple[str, str]], list[str]]:
+        """Separate [TABLE]...[/TABLE] blocks from prose text."""
+        import re
+
+        table_blocks = []
+        text_parts = []
+
+        table_pattern = re.compile(
+            r"\[TABLE[^\]]*\]\n(.*?)\n\[/TABLE\]", re.DOTALL
+        )
+
+        last_end = 0
+        for match in table_pattern.finditer(text):
+            before = text[last_end:match.start()].strip()
+            if before:
+                text_parts.append(before)
+
+            context_start = max(0, match.start() - 200)
+            table_context = text[context_start:match.start()].strip()
+            table_blocks.append((match.group(1), table_context))
+            last_end = match.end()
+
+        remaining = text[last_end:].strip()
+        if remaining:
+            text_parts.append(remaining)
+
+        if not table_blocks and not text_parts:
+            text_parts.append(text)
+
+        return table_blocks, text_parts
+
+    # ── FIX #1: SequenceMatcher instead of difflib.get_close_matches ──
+
+    @staticmethod
+    def _find_end_index(remaining: str, last_few_words: str) -> int:
+        """
+        Find the end index of `last_few_words` within `remaining` using
+        SequenceMatcher. Returns -1 if no good match found.
+        """
+        matcher = SequenceMatcher(
+            None, remaining.lower(), last_few_words.lower(), autojunk=False
+        )
+        match = matcher.find_longest_match(
+            0, len(remaining), 0, len(last_few_words)
+        )
+        # Accept match if it covers at least 60% of the reported last words
+        if match.size > len(last_few_words) * 0.6:
+            return match.a + match.size
+        return -1
+
+    def _llm_semantic_chunker(
+        self,
+        text: str,
+        source_name: str,
+        page_num: int,
+        parent_id: str,
+        file_hash: str = "",
+        parent_idx: int = 0,
+    ) -> list[tuple[Document, dict]]:
+        """
+        Iteratively extracts semantic chunks using the LLM.
+        FIX #1: Uses SequenceMatcher + progress guard to avoid infinite loops.
+        """
+        chunks = []
+        remaining_text = text.strip()
+        chunk_index = 0
+        max_iterations = settings.child_max_iterations
+
+        while (
+            remaining_text
+            and len(remaining_text.strip()) > settings.child_min_text_length
+            and chunk_index < max_iterations
+        ):
+            before_len = len(remaining_text)  # FIX #1: progress guard
+
+            message = HumanMessage(
+                content=f"Text to process:\n\n{remaining_text}"
+            )
+
+            try:
+                response = self.llm.invoke([
+                    SystemMessage(content=CHUNKER_SYSTEM_PROMPT), message
+                ])
+
+                # FIX #15: Use centralized JSON extraction
+                raw = extract_json(response.content)
+                data = json.loads(raw)
+
+                chunk_text = data.get("chunk_text", "").strip()
+                last_few_words = data.get("last_few_words", "").strip()
+                dynamic_metadata = data.get("metadata", {})
+
+                if not chunk_text or not last_few_words:
+                    logger.warning("LLM chunker returned empty chunk/words. Breaking.")
+                    break
+
+                # ── FIX #1: SequenceMatcher-based boundary detection ──
+                end_idx = self._find_end_index(remaining_text, last_few_words)
+
+                if end_idx != -1:
+                    extracted = remaining_text[:end_idx].strip()
+                    remaining_text = remaining_text[end_idx:].strip()
+                else:
+                    # Fallback: try to find chunk_text prefix
+                    prefix = chunk_text[:30]
+                    pos = remaining_text.find(prefix)
+                    if pos != -1:
+                        end_pos = pos + len(chunk_text)
+                        extracted = remaining_text[pos:end_pos].strip()
+                        remaining_text = remaining_text[end_pos:].strip()
+                    else:
+                        # Last resort: can't make progress, bail
+                        logger.warning(
+                            f"Chunker cannot locate boundary in remaining text. "
+                            f"Breaking to avoid infinite loop."
+                        )
+                        break
+
+                # FIX #1: Progress guard — if we didn't shrink, stop
+                if len(remaining_text) >= before_len:
+                    logger.warning(
+                        "Chunker made no progress; stopping to avoid duplication."
+                    )
+                    break
+
+                meta = {
+                    "source_file": source_name,
+                    "page": page_num,
+                    "chunk_index": chunk_index,
+                    "parent_id": parent_id,
+                }
+
+                doc = Document(page_content=extracted, metadata=meta)
+                chunks.append((doc, dynamic_metadata))
+                chunk_index += 1
+
+            except json.JSONDecodeError as e:
+                logger.error(f"LLM Chunker JSON decode error: {e}. Breaking.")
+                break
+            except Exception as e:
+                logger.error(f"LLM Chunker error: {e}. Breaking.")
+                break
+
+        # Handle leftover text
+        if remaining_text and len(remaining_text.strip()) > 20:
+            meta = {
+                "source_file": source_name,
+                "page": page_num,
+                "chunk_index": chunk_index,
+                "parent_id": parent_id,
+                "content_type": "text_overflow",
+            }
+            doc = Document(page_content=remaining_text.strip(), metadata=meta)
+            chunks.append((doc, {"topic": "overflow", "content_type": "overflow"}))
+
+        return chunks
+
+    def _chunk_table(
+        self,
+        table_text: str,
+        table_context: str,
+        source_name: str,
+        page_num: int,
+        parent_id: str,
+        file_hash: str = "",
+        parent_idx: int = 0,
+        table_idx: int = 0,
+    ) -> list[Document]:
+        """
+        Programmatic row-level table chunking.
+        FIX #5: Correct separator column count.
+        FIX #2: Deterministic child IDs.
+        """
+        lines = table_text.strip().split("\n")
+        if len(lines) < 2:
+            return []
+
+        header_line = lines[0]
+        separator_idx = -1
+        for i, line in enumerate(lines[1:], start=1):
+            if set(line.replace("|", "").strip()) <= {"-", ":", " "}:
+                separator_idx = i
+                break
+
+        if separator_idx == -1:
+            header = header_line
+            data_lines = lines[1:]
+        else:
+            header = header_line
+            data_lines = lines[separator_idx + 1:]
+
+        # FIX #5: Count cells, not pipe characters
+        num_cols = len([c for c in header.strip("|").split("|") if c.strip()])
+        separator = "| " + " | ".join(["---"] * num_cols) + " |"
+
+        rows_per_chunk = 3
+        chunks = []
+
+        for i in range(0, len(data_lines), rows_per_chunk):
+            chunk_rows = data_lines[i : i + rows_per_chunk]
+            chunk_text = f"{header}\n{separator}\n" + "\n".join(chunk_rows)
+
+            if table_context:
+                chunk_text = f"Context: {table_context}\n\n{chunk_text}"
+
+            # FIX #2: Deterministic child ID
+            child_id = make_deterministic_id(
+                file_hash, page_num, "table", parent_idx, table_idx, i
+            )
+            doc = Document(
+                page_content=chunk_text,
+                metadata={
+                    "doc_id": child_id,
+                    "parent_id": parent_id,
+                    "source_file": source_name,
+                    "page": page_num,
+                    "content_type": "table_row_chunk",
+                    "table_row_start": i,
+                    "table_row_end": min(i + rows_per_chunk, len(data_lines)),
+                    "file_hash": file_hash,
+                },
+            )
+            chunks.append(doc)
+
+        return chunks
+```
+
+---
+
+## storage/parent_store.py (REWRITTEN — SQLite-backed)
+
+```python
+# storage/parent_store.py
+"""
+FIX #7: Persistent parent document store backed by SQLite.
+Survives process restarts. Enables CLI ingest→query state sharing.
+"""
+
+import json
+import logging
+from typing import Optional
+from pathlib import Path
+
+from langchain_core.documents import Document
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class ParentDocumentStore:
+    """SQLite-backed store for parent chunks. Persists across restarts."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        import sqlite3
+
+        self.db_path = db_path or str(settings.db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_table()
+        self._cache: dict[str, Document] = {}
+        self._cache_loaded = False
+
+    def _ensure_table(self):
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS parent_chunks (
+                doc_id TEXT PRIMARY KEY,
+                source_file TEXT,
+                page INTEGER,
+                content_type TEXT,
+                text TEXT NOT NULL,
+                metadata_json TEXT,
+                file_hash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.commit()
+
+    def _load_cache(self):
+        """Load all parent chunks into memory for fast lookup."""
+        if self._cache_loaded:
+            return
+
+        cursor = self.conn.execute(
+            "SELECT doc_id, text, source_file, page, content_type, metadata_json "
+            "FROM parent_chunks"
+        )
+        for doc_id, text, source, page, ctype, meta_json in cursor:
+            metadata = {}
+            if source:
+                metadata["source_file"] = source
+            if page is not None:
+                metadata["page"] = page
+            if ctype:
+                metadata["content_type"] = ctype
+            if meta_json:
+                try:
+                    metadata.update(json.loads(meta_json))
+                except json.JSONDecodeError:
+                    pass
+            metadata["doc_id"] = doc_id
+            self._cache[doc_id] = Document(page_content=text, metadata=metadata)
+
+        self._cache_loaded = True
+        logger.info(f"Parent store cache: {len(self._cache)} documents loaded")
+
+    def add_documents(self, documents: list[Document]) -> None:
+        """Store parent chunks in SQLite."""
+        for doc in documents:
+            parent_id = doc.metadata.get("doc_id")
+            if not parent_id:
+                logger.warning("Parent document missing doc_id, skipping.")
+                continue
+
+            # Separate known columns from extra metadata
+            source = doc.metadata.get("source_file", "")
+            page = doc.metadata.get("page")
+            ctype = doc.metadata.get("content_type", "parent")
+            file_hash = doc.metadata.get("file_hash", "")
+
+            extra_meta = {
+                k: v for k, v in doc.metadata.items()
+                if k not in {
+                    "doc_id", "source_file", "page", "content_type", "file_hash"
+                }
+                and isinstance(v, (str, int, float, bool))
+            }
+
+            self.conn.execute(
+                """INSERT OR REPLACE INTO parent_chunks
+                   (doc_id, source_file, page, content_type, text, metadata_json, file_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    parent_id,
+                    source,
+                    page,
+                    ctype,
+                    doc.page_content,
+                    json.dumps(extra_meta),
+                    file_hash,
+                ),
+            )
+            self._cache[parent_id] = doc
+
+        self.conn.commit()
+        logger.info(f"Stored {len(documents)} parent chunks in SQLite")
+
+    def get_parent(self, parent_id: str) -> Optional[Document]:
+        """Retrieve a parent chunk by ID."""
+        self._load_cache()
+        return self._cache.get(parent_id)
+
+    def get_parents(self, parent_ids: list[str]) -> list[Document]:
+        """Retrieve multiple parent chunks by IDs."""
+        self._load_cache()
+        return [self._cache[pid] for pid in parent_ids if pid in self._cache]
+
+    def list_all_ids(self) -> list[str]:
+        """List all stored parent IDs."""
+        self._load_cache()
+        return list(self._cache.keys())
+
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """Delete all parent chunks for a given file hash (for re-ingestion)."""
+        cursor = self.conn.execute(
+            "DELETE FROM parent_chunks WHERE file_hash = ?", (file_hash,)
+        )
+        self.conn.commit()
+        # Invalidate cache
+        self._cache = {
+            k: v for k, v in self._cache.items()
+            if v.metadata.get("file_hash") != file_hash
+        }
+        return cursor.rowcount
+
+    def count(self) -> int:
+        """Count total parent chunks."""
+        cursor = self.conn.execute("SELECT COUNT(*) FROM parent_chunks")
+        return cursor.fetchone()[0]
+
+    def close(self):
+        """Close the database connection."""
+        self.conn.close()
+```
+
+---
+
+## storage/bm25_store.py (FIXED — SQLite-backed persistence)
+
+```python
+# storage/bm25_store.py
+"""
+FIX #7: BM25 keyword index backed by SQLite for persistence.
+Rebuilds index from stored documents on startup.
+"""
+
+import logging
+import re
+from typing import Optional
+from pathlib import Path
+
+import nltk
+from rank_bm25 import BM25Okapi
+from langchain_core.documents import Document
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+try:
+    nltk.data.find("tokenizers/punkt_tab")
+except LookupError:
+    nltk.download("punkt_tab", quiet=True)
+try:
+    nltk.data.find("corpora/stopwords")
+except LookupError:
+    nltk.download("stopwords", quiet=True)
+
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+
+STOP_WORDS = set(stopwords.words("english"))
+
+
+def tokenize(text: str) -> list[str]:
+    text = text.lower()
+    tokens = word_tokenize(text)
+    return [t for t in tokens if t.isalnum() and t not in STOP_WORDS and len(t) > 1]
+
+
+class BM25Store:
+    """BM25 keyword index with SQLite-backed persistence."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        import sqlite3
+
+        self.db_path = db_path or str(settings.db_path)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_table()
+
+        self.bm25: Optional[BM25Okapi] = None
+        self._doc_count = 0
+
+        # Rebuild BM25 index from stored documents
+        self._rebuild_index()
+
+    def _ensure_table(self):
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS bm25_documents (
+                doc_id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                source_file TEXT,
+                page INTEGER,
+                content_type TEXT,
+                text TEXT NOT NULL,
+                metadata_json TEXT,
+                file_hash TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def _rebuild_index(self):
+        """Rebuild BM25 index from SQLite on startup."""
+        cursor = self.conn.execute("SELECT doc_id, text FROM bm25_documents")
+        rows = cursor.fetchall()
+
+        if rows:
+            self.documents = []
+            self.tokenized_corpus = []
+            for doc_id, text in rows:
+                self.documents.append(doc_id)  # We'll load full docs on demand
+                self.tokenized_corpus.append(tokenize(text))
+
+            self.bm25 = BM25Okapi(self.tokenized_corpus)
+            self._doc_count = len(rows)
+            logger.info(f"BM25 index rebuilt: {self._doc_count} documents from SQLite")
+        else:
+            self.documents = []
+            self.tokenized_corpus = []
+            self.bm25 = None
+            self._doc_count = 0
+
+    def add_documents(self, documents: list[Document]) -> None:
+        """Add documents to BM25 index and persist to SQLite."""
+        import json
+
+        for doc in documents:
+            doc_id = doc.metadata.get("doc_id", "")
+            parent_id = doc.metadata.get("parent_id", "")
+            source = doc.metadata.get("source_file", "")
+            page = doc.metadata.get("page")
+            ctype = doc.metadata.get("content_type", "")
+            file_hash = doc.metadata.get("file_hash", "")
+
+            extra_meta = {
+                k: v for k, v in doc.metadata.items()
+                if k not in {
+                    "doc_id", "parent_id", "source_file", "page",
+                    "content_type", "file_hash"
+                }
+                and isinstance(v, (str, int, float, bool))
+            }
+
+            self.conn.execute(
+                """INSERT OR REPLACE INTO bm25_documents
+                   (doc_id, parent_id, source_file, page, content_type,
+                    text, metadata_json, file_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    doc_id, parent_id, source, page, ctype,
+                    doc.page_content, json.dumps(extra_meta), file_hash,
+                ),
+            )
+
+        self.conn.commit()
+        # Rebuild in-memory index
+        self._rebuild_index()
+
+    def search(self, query: str, top_k: int = None) -> list[tuple[Document, float]]:
+        """
+        BM25 keyword search.
+        Returns: list of (Document, score) tuples.
+        """
+        top_k = top_k or settings.bm25_top_k
+
+        if not self.bm25:
+            # FIX #7: Warn about empty index (e.g., after restart without rebuild)
+            logger.warning(
+                "BM25 index is empty — was the store rebuilt after restart? "
+                "Hybrid retrieval may degrade to vector-only."
+            )
+            return []
+
+        tokenized_query = tokenize(query)
+        scores = self.bm25.get_scores(tokenized_query)
+
+        scored = list(enumerate(scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:top_k]
+
+        # Load full documents from SQLite
+        results = []
+        for idx, score in top:
+            if score <= 0:
+                continue
+            doc = self._load_document(idx)
+            if doc:
+                results.append((doc, float(score)))
+
+        return results
+
+    def _load_document(self, corpus_index: int) -> Optional[Document]:
+        """Load a document by its corpus index position."""
+        import json
+
+        cursor = self.conn.execute(
+            "SELECT doc_id, text, parent_id, source_file, page, "
+            "content_type, metadata_json "
+            "FROM bm25_documents LIMIT 1 OFFSET ?",
+            (corpus_index,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        doc_id, text, parent_id, source, page, ctype, meta_json = row
+        metadata = {"doc_id": doc_id}
+        if parent_id:
+            metadata["parent_id"] = parent_id
+        if source:
+            metadata["source_file"] = source
+        if page is not None:
+            metadata["page"] = page
+        if ctype:
+            metadata["content_type"] = ctype
+        if meta_json:
+            try:
+                metadata.update(json.loads(meta_json))
+            except json.JSONDecodeError:
+                pass
+
+        return Document(page_content=text, metadata=metadata)
+
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """Delete all BM25 docs for a given file hash."""
+        cursor = self.conn.execute(
+            "DELETE FROM bm25_documents WHERE file_hash = ?", (file_hash,)
+        )
+        self.conn.commit()
+        self._rebuild_index()
+        return cursor.rowcount
+
+    def count(self) -> int:
+        cursor = self.conn.execute("SELECT COUNT(*) FROM bm25_documents")
+        return cursor.fetchone()[0]
+
+    def clear(self) -> None:
+        """Clear the BM25 index and SQLite store."""
+        self.conn.execute("DELETE FROM bm25_documents")
+        self.conn.commit()
+        self.documents = []
+        self.tokenized_corpus = []
+        self.bm25 = None
+        self._doc_count = 0
+
+    def close(self):
+        self.conn.close()
+```
+
+---
+
+## storage/vector_store.py
+
+```python
+# storage/vector_store.py
+"""
+Qdrant vector store for child chunk embeddings.
+
+FIX #2: Deterministic uuid5 IDs (no negative hash).
+FIX #14: Copy payload dict instead of mutating Qdrant response.
+"""
+
+import logging
+from typing import Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue,
+)
+from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from config import settings
+from utils import make_deterministic_id
+
+logger = logging.getLogger(__name__)
+
+
+class QdrantVectorStore:
+    """Manages child chunk storage and vector search in Qdrant."""
+
+    def __init__(self):
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model=settings.embedding_model,
+            google_api_key=settings.gemini_api_key,
+            task_type="retrieval_document",
+        )
+
+        self.query_embeddings = GoogleGenerativeAIEmbeddings(
+            model=settings.embedding_model,
+            google_api_key=settings.gemini_api_key,
+            task_type="retrieval_query",
+        )
+
+        self.client = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+        )
+
+        self.collection_name = settings.qdrant_collection_child
+        self._ensure_collection()
+
+    def _ensure_collection(self):
+        if not self.client.collection_exists(self.collection_name):
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=settings.embedding_dim,
+                    distance=Distance.COSINE,
+                ),
+            )
+            logger.info(f"Created Qdrant collection: {self.collection_name}")
+
+    def add_documents(self, documents: list[Document]) -> list[str]:
+        """Embed and store child chunks in Qdrant. Returns list of point IDs."""
+        if not documents:
+            return []
+
+        texts = [doc.page_content for doc in documents]
+        vectors = self.embeddings.embed_documents(texts)
+
+        points = []
+        ids = []
+        for doc, vector in zip(documents, vectors):
+            # FIX #2: Use deterministic uuid5 instead of hash()
+            point_id = doc.metadata.get("doc_id") or make_deterministic_id(
+                doc.page_content
+            )
+            ids.append(point_id)
+
+            payload = {
+                "text": doc.page_content,
+                **{
+                    k: v for k, v in doc.metadata.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
+            }
+
+            points.append(PointStruct(
+                id=point_id,
+                vector=vector,
+                payload=payload,
+            ))
+
+        batch_size = 100
+        for i in range(0, len(points), batch_size):
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points[i : i + batch_size],
+            )
+
+        logger.info(f"Added {len(points)} child chunks to Qdrant")
+        return ids
+
+    def search(
+        self,
+        query: str,
+        top_k: int = None,
+        filters: Optional[dict] = None,
+    ) -> list[tuple[Document, float]]:
+        """Vector similarity search."""
+        top_k = top_k or settings.vector_top_k
+        query_vector = self.query_embeddings.embed_query(query)
+
+        qdrant_filter = None
+        if filters:
+            conditions = [
+                FieldCondition(key=k, match=MatchValue(value=v))
+                for k, v in filters.items()
+            ]
+            qdrant_filter = Filter(must=conditions)
+
+        results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=query_vector,
+            limit=top_k,
+            query_filter=qdrant_filter,
+            with_payload=True,
+        )
+
+        documents_with_scores = []
+        for hit in results:
+            # FIX #14: Copy payload instead of mutating the response
+            payload = dict(hit.payload or {})
+            text = payload.pop("text", "")
+            doc = Document(page_content=text, metadata=payload)
+            documents_with_scores.append((doc, hit.score))
+
+        return documents_with_scores
+
+    def delete_by_file_hash(self, file_hash: str) -> int:
+        """Delete all child chunks for a given file hash."""
+        try:
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="file_hash", match=MatchValue(value=file_hash)
+                        )
+                    ]
+                ),
+            )
+            logger.info(f"Deleted Qdrant points for file_hash={file_hash}")
+            return 1
+        except Exception as e:
+            logger.warning(f"Failed to delete Qdrant points: {e}")
+            return 0
+
+    def count(self) -> int:
+        """Count points in the collection."""
+        try:
+            info = self.client.get_collection(self.collection_name)
+            return info.points_count or 0
+        except Exception:
+            return 0
+
+    def delete_collection(self):
+        """Delete the entire collection."""
+        if self.client.collection_exists(self.collection_name):
+            self.client.delete_collection(self.collection_name)
+            logger.info(f"Deleted collection: {self.collection_name}")
+```
+
+---
+
+## retrieval/reranker.py
+
+```python
+# retrieval/reranker.py
+"""
+FIX #12: Batch relevance grading option.
+FIX #15: Centralized JSON extraction.
+"""
+
+import json
+import logging
+from typing import Optional
+
+from langchain_ollama import ChatOllama
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.documents import Document
+
+from config import settings
+from utils import extract_json
+
+logger = logging.getLogger(__name__)
+
+RERANK_SYSTEM_PROMPT = """You are a relevance scoring agent. Score how relevant a document is to a given query.
+
+Scoring Scale:
+- 10: Perfectly relevant — directly answers the query
+- 7-9: Highly relevant — substantial related information
+- 4-6: Moderately relevant — some related information
+- 1-3: Not relevant — unrelated to the query
+
+Respond ONLY with valid JSON:
+{
+  "score": <integer 1-10>,
+  "reasoning": "<brief explanation>"
+}
+"""
+
+# FIX #12: Batch prompt — score all documents in ONE call
+BATCH_RERANK_PROMPT = """You are a relevance scoring agent. Score each document's relevance to the query.
+
+Scoring Scale:
+- 10: Perfectly relevant
+- 7-9: Highly relevant
+- 4-6: Moderately relevant
+- 1-3: Not relevant
+
+Respond ONLY with a valid JSON array:
+[
+  {"doc_index": 0, "score": <1-10>, "reasoning": "<brief>"},
+  {"doc_index": 1, "score": <1-10>, "reasoning": "<brief>"}
+]
+"""
+
+REVALIDATION_PROMPT = """You are a document re-validation agent. Given a query and retrieved documents, determine:
+
+1. Are there contradictions between the documents?
+2. Is the information sufficient to answer the query?
+3. Which documents are most trustworthy?
+
+Respond ONLY with valid JSON:
+{
+  "contradictions_found": true/false,
+  "contradiction_details": "<description if any>",
+  "sufficient_information": true/false,
+  "missing_information": "<what's missing>",
+  "trust_ranking": [<list of doc indices from most to least trustworthy>]
+}
+"""
+
+
+class GemmaReranker:
+    """Re-ranker using Gemma 4 26B via Ollama."""
+
+    def __init__(self):
+        self.llm = ChatOllama(
+            model=settings.reranker_model,
+            base_url=settings.ollama_base_url,
+            temperature=0.0,
+            num_ctx=8192,
+        )
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[tuple[Document, float]],
+        top_k: int = None,
+    ) -> list[tuple[Document, float, str]]:
+        """
+        Re-rank documents using batch scoring for efficiency.
+        FIX #12: Batch all documents into one LLM call.
+        """
+        top_k = top_k or settings.rerank_top_k
+
+        if not documents:
+            return []
+
+        # Try batch scoring first
+        batch_scores = self._batch_score(query, documents)
+
+        if batch_scores is not None:
+            # Batch succeeded
+            scored_docs = []
+            for i, (doc, orig_score) in enumerate(documents):
+                score, reasoning = batch_scores.get(i, (5, "batch fallback"))
+                scored_docs.append((doc, score, reasoning))
+        else:
+            # Fallback to per-document scoring
+            scored_docs = []
+            for doc, orig_score in documents:
+                score, reasoning = self._score_document(query, doc.page_content)
+                scored_docs.append((doc, score, reasoning))
+
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        return scored_docs[:top_k]
+
+    def _batch_score(
+        self, query: str, documents: list[tuple[Document, float]]
+    ) -> Optional[dict[int, tuple[int, str]]]:
+        """
+        Score all documents in a single LLM call.
+        Returns dict of {index: (score, reasoning)} or None on failure.
+        """
+        docs_text = ""
+        for i, (doc, _) in enumerate(documents):
+            truncated = doc.page_content[:1000]
+            docs_text += f"\n--- Document {i} ---\n{truncated}\n"
+
+        message = HumanMessage(content=f"Query: {query}\n{docs_text}")
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=BATCH_RERANK_PROMPT), message
+            ])
+            raw = extract_json(response.content)
+            data = json.loads(raw)
+
+            if isinstance(data, dict):
+                data = data.get("grades", [data])
+
+            result = {}
+            for item in data:
+                idx = int(item.get("doc_index", 0))
+                score = max(1, min(10, int(item.get("score", 5))))
+                reasoning = item.get("reasoning", "")
+                result[idx] = (score, reasoning)
+
+            return result
+
+        except Exception as e:
+            logger.warning(f"Batch reranking failed: {e}. Falling back to per-doc.")
+            return None
+
+    def _score_document(self, query: str, document_text: str) -> tuple[int, str]:
+        """Score a single document (fallback)."""
+        truncated_doc = document_text[:2000]
+        message = HumanMessage(content=(
+            f"Query: {query}\n\nDocument:\n{truncated_doc}"
+        ))
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=RERANK_SYSTEM_PROMPT), message
+            ])
+            data = json.loads(extract_json(response.content))
+            score = max(1, min(10, int(data.get("score", 5))))
+            reasoning = data.get("reasoning", "No reasoning provided")
+            return score, reasoning
+        except Exception as e:
+            logger.warning(f"Per-doc reranking failed: {e}")
+            return 5, f"Scoring failed: {str(e)[:100]}"
+
+    def revalidate(self, query: str, documents: list[Document]) -> dict:
+        """Re-validate documents for contradictions and sufficiency."""
+        docs_text = ""
+        for i, doc in enumerate(documents):
+            docs_text += f"\n--- Document {i + 1} ---\n{doc.page_content[:1000]}\n"
+
+        message = HumanMessage(content=(
+            f"Query: {query}\n\nRetrieved Documents:{docs_text}"
+        ))
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=REVALIDATION_PROMPT), message
+            ])
+            return json.loads(extract_json(response.content))
+        except Exception as e:
+            logger.warning(f"Re-validation failed: {e}")
+            return {
+                "contradictions_found": False,
+                "sufficient_information": True,
+                "error": str(e),
+            }
+```
+
+---
+
+## retrieval/parent_expander.py
+
+```python
+# retrieval/parent_expander.py
+"""
+FIX #9: Track maximum child score per parent instead of dropping duplicates.
+"""
+
+import logging
+from langchain_core.documents import Document
+
+from storage.parent_store import ParentDocumentStore
+
+logger = logging.getLogger(__name__)
+
+
+class ParentExpander:
+    """Expands child chunk results to parent document context."""
+
+    def __init__(self, parent_store: ParentDocumentStore):
+        self.parent_store = parent_store
+
+    def expand(self, child_results: list[tuple[Document, float]]) -> list[Document]:
+        """
+        Given child chunks with scores, return deduplicated parent documents.
+
+        FIX #9: Track the max child score per parent, not just the first.
+        """
+        # Collect best score per parent
+        parent_best: dict[str, tuple[float, Document]] = {}  # parent_id -> (best_score, child_doc)
+
+        for child_doc, score in child_results:
+            parent_id = child_doc.metadata.get("parent_id")
+            if not parent_id:
+                # No parent — return child as-is (use doc_id as key)
+                key = f"__child__{child_doc.metadata.get('doc_id', id(child_doc))}"
+                if key not in parent_best or score > parent_best[key][0]:
+                    parent_best[key] = (score, child_doc)
+                continue
+
+            if parent_id not in parent_best or score > parent_best[parent_id][0]:
+                parent_best[parent_id] = (score, child_doc)
+
+        # Expand to parent documents
+        expanded = []
+        for key, (best_score, representative_child) in parent_best.items():
+            if key.startswith("__child__"):
+                # No parent expansion for standalone children
+                expanded.append(representative_child)
+                continue
+
+            parent_doc = self.parent_store.get_parent(key)
+            if parent_doc:
+                expanded_doc = Document(
+                    page_content=parent_doc.page_content,
+                    metadata={
+                        **parent_doc.metadata,
+                        "matched_child_text": representative_child.page_content[:500],
+                        "child_retrieval_score": best_score,
+                        "expansion_type": "parent_expansion",
+                    },
+                )
+                expanded.append(expanded_doc)
+            else:
+                logger.warning(f"Parent {key} not found, using child chunk.")
+                expanded.append(representative_child)
+
+        logger.info(
+            f"Parent expansion: {len(child_results)} children → "
+            f"{len(expanded)} unique parents"
+        )
+        return expanded
+```
+
+---
+
+## generation/self_rag.py
+
+```python
+# generation/self_rag.py
+"""
+Self-RAG: Self-Reflective Retrieval-Augmented Generation.
+
+FIX #4: Separate generation modes for no-retrieval path.
+FIX #8: Failure counter in grading.
+FIX #12: Batch relevance grading.
+FIX #15: Centralized JSON extraction.
+FIX #18: Strict support grading (PARTIALLY_SUPPORTED fails by default).
+"""
+
+import json
+import logging
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.documents import Document
+
+from config import settings
+from utils import extract_json
+
+logger = logging.getLogger(__name__)
+
+
+class RetrievalDecision(str, Enum):
+    RETRIEVE = "retrieve"
+    NO_RETRIEVAL = "no_retrieval"
+
+
+class RelevanceGrade(str, Enum):
+    RELEVANT = "relevant"
+    IRRELEVANT = "irrelevant"
+
+
+class SupportGrade(str, Enum):
+    FULLY_SUPPORTED = "fully_supported"
+    PARTIALLY_SUPPORTED = "partially_supported"
+    NO_SUPPORT = "no_support"
+
+
+@dataclass
+class SelfRAGResult:
+    query: str
+    answer: str
+    retrieval_decision: RetrievalDecision
+    relevance_grade: RelevanceGrade
+    support_grade: SupportGrade
+    usefulness_score: int
+    num_retries: int
+    documents_used: list[Document] = field(default_factory=list)
+    transformation_history: list[str] = field(default_factory=list)
+    is_successful: bool = False
+
+
+# ── Prompts ─────────────────────────────────────────────────────────
+
+RETRIEVAL_DECISION_PROMPT = """You are a retrieval decision agent. Given a query, determine if external knowledge retrieval is needed.
+
+Rules:
+- If the query requires specific facts, data, or information → RETRIEVE
+- If the query is about general knowledge, greetings, or simple reasoning → NO_RETRIEVAL
+- When in doubt, choose RETRIEVE
+
+Respond ONLY with valid JSON:
+{
+  "decision": "retrieve" or "no_retrieval",
+  "reasoning": "<brief explanation>"
+}
+"""
+
+# FIX #12: Batch relevance grading — one call for all documents
+BATCH_RELEVANCE_PROMPT = """You are a document relevance grading agent. Given a query and multiple documents, grade each document's relevance.
+
+A document is RELEVANT if it contains information that could help answer the query.
+A document is IRRELEVANT if it has no connection to the query.
+
+Respond ONLY with a valid JSON object:
+{
+  "grades": [
+    {"doc_index": 0, "grade": "relevant" or "irrelevant", "reasoning": "<brief>"},
+    {"doc_index": 1, "grade": "relevant" or "irrelevant", "reasoning": "<brief>"}
+  ]
+}
+"""
+
+SUPPORT_GRADE_PROMPT = """You are a factual support grading agent. Given a generated response and the source documents, assess if the response is supported by the documents.
+
+- FULLY_SUPPORTED: All claims are directly supported by the documents
+- PARTIALLY_SUPPORTED: Some claims supported, others extrapolated
+- NO_SUPPORT: Significant claims not found in documents (hallucination)
+
+Be strict. Only mark as FULLY_SUPPORTED if you can verify each major claim.
+
+Respond ONLY with valid JSON:
+{
+  "grade": "fully_supported" or "partially_supported" or "no_support",
+  "unsupported_claims": ["<claim 1>", "<claim 2>"],
+  "reasoning": "<brief explanation>"
+}
+"""
+
+USEFULNESS_PROMPT = """You are a response usefulness grading agent. Rate how useful the response is for the query.
+
+Scoring Scale:
+- 5: Perfectly useful — directly and completely answers the query
+- 4: Mostly useful — answers the main point but could be more complete
+- 3: Somewhat useful — partially answers but misses key aspects
+- 2: Barely useful — mostly misses the point
+- 1: Not useful — does not address the query
+
+Respond ONLY with valid JSON:
+{
+  "score": <integer 1-5>,
+  "reasoning": "<brief explanation>"
+}
+"""
+
+QUERY_TRANSFORM_PROMPT = """You are a query transformation agent. Given an original query and why previous attempts failed, transform the query.
+
+Strategies:
+1. Make more specific
+2. Add context
+3. Decompose into sub-queries
+4. Use synonyms
+5. Remove ambiguous terms
+
+Respond ONLY with valid JSON:
+{
+  "transformed_query": "<improved query>",
+  "strategy_used": "<which strategy>",
+  "reasoning": "<why this should help>"
+}
+"""
+
+RAG_GENERATION_PROMPT = """You are a helpful, accurate AI assistant. Answer the user's query based ONLY on the provided context documents.
+
+Rules:
+1. Use ONLY information from the provided context
+2. If the context doesn't contain enough information, say "I don't have sufficient information to fully answer this question"
+3. Cite specific parts of the context when making claims
+4. Be precise and avoid speculation
+5. Structure your answer clearly
+
+Context Documents:
+{context}
+
+User Query: {query}
+
+Provide a comprehensive, accurate answer:
+"""
+
+# FIX #4: Separate prompt for general (no-retrieval) generation
+GENERAL_GENERATION_PROMPT = """You are a helpful, accurate AI assistant. Answer the user's query using your general knowledge.
+
+Rules:
+1. Be accurate and helpful
+2. If you're unsure, say so
+3. Structure your answer clearly
+
+User Query: {query}
+
+Answer:
+"""
+
+
+class SelfRAG:
+    """Self-Reflective RAG with evaluation and retry loop."""
+
+    def __init__(self):
+        self.llm = ChatGoogleGenerativeAI(
+            model=settings.llm_model,
+            google_api_key=settings.gemini_api_key,
+            temperature=0.1,
+            max_output_tokens=4096,
+        )
+
+    def decide_retrieval(self, query: str) -> tuple[RetrievalDecision, str]:
+        response = self._invoke_json(
+            RETRIEVAL_DECISION_PROMPT, f"Query: {query}"
+        )
+        decision_str = response.get("decision", "retrieve")
+        reasoning = response.get("reasoning", "")
+        try:
+            decision = RetrievalDecision(decision_str)
+        except ValueError:
+            decision = RetrievalDecision.RETRIEVE
+        return decision, reasoning
+
+    def grade_relevance_batch(
+        self, query: str, documents: list[Document]
+    ) -> tuple[RelevanceGrade, list[Document], str]:
+        """
+        FIX #12: Batch relevance grading — single LLM call for all documents.
+        FIX #8: Track failures explicitly.
+        """
+        if not documents:
+            return RelevanceGrade.IRRELEVANT, [], "No documents provided"
+
+        docs_text = ""
+        for i, doc in enumerate(documents):
+            docs_text += f"\n--- Document {i} ---\n{doc.page_content[:1200]}\n"
+
+        message = HumanMessage(content=f"Query: {query}\n{docs_text}")
+        result = self._invoke_json(BATCH_RELEVANCE_PROMPT, f"Query: {query}\n{docs_text}")
+
+        if not result or "grades" not in result:
+            # FIX #8: API failure — log and return conservative result
+            logger.warning(
+                "Batch relevance grading API failure. "
+                "Returning all documents as relevant (conservative fallback)."
+            )
+            return RelevanceGrade.RELEVANT, documents, "Grading API failed — keeping all docs"
+
+        relevant_docs = []
+        failure_count = 0
+        all_reasoning = []
+
+        for item in result["grades"]:
+            idx = int(item.get("doc_index", -1))
+            grade_str = item.get("grade", "relevant")
+            reasoning = item.get("reasoning", "")
+
+            if idx < 0 or idx >= len(documents):
+                failure_count += 1
+                continue
+
+            try:
+                grade = RelevanceGrade(grade_str)
+            except ValueError:
+                failure_count += 1
+                grade = RelevanceGrade.RELEVANT  # Conservative default
+
+            if grade == RelevanceGrade.RELEVANT:
+                relevant_docs.append(documents[idx])
+            all_reasoning.append(f"Doc {idx}: {grade.value} — {reasoning}")
+
+        # FIX #8: Warn if many failures
+        if failure_count > 0:
+            logger.warning(
+                f"Relevance grading had {failure_count} failures out of "
+                f"{len(result['grades'])} grades"
+            )
+
+        if not relevant_docs:
+            return RelevanceGrade.IRRELEVANT, [], "All documents were irrelevant"
+        elif len(relevant_docs) < len(documents):
+            return (
+                RelevanceGrade.RELEVANT,
+                relevant_docs,
+                f"{len(relevant_docs)}/{len(documents)} docs relevant",
+            )
+        else:
+            return RelevanceGrade.RELEVANT, relevant_docs, "All documents relevant"
+
+    def generate_with_docs(self, query: str, documents: list[Document]) -> str:
+        """Generate response grounded in documents."""
+        context = self._format_context(documents)
+        prompt = RAG_GENERATION_PROMPT.format(context=context, query=query)
+        response = self.llm.invoke([
+            SystemMessage(content="You are a precise, factual assistant."),
+            HumanMessage(content=prompt),
+        ])
+        return response.content
+
+    def generate_general(self, query: str) -> str:
+        """
+        FIX #4: Generate response using general knowledge (no documents).
+        Used when retrieval is not needed.
+        """
+        prompt = GENERAL_GENERATION_PROMPT.format(query=query)
+        response = self.llm.invoke([
+            SystemMessage(content="You are a helpful, accurate assistant."),
+            HumanMessage(content=prompt),
+        ])
+        return response.content
+
+    def grade_support(
+        self, query: str, response: str, documents: list[Document]
+    ) -> tuple[SupportGrade, list[str], str]:
+        context = self._format_context(documents)
+        content = (
+            f"Query: {query}\n\n"
+            f"Generated Response:\n{response}\n\n"
+            f"Source Documents:\n{context}"
+        )
+
+        result = self._invoke_json(SUPPORT_GRADE_PROMPT, content)
+        grade_str = result.get("grade", "partially_supported")
+        unsupported = result.get("unsupported_claims", [])
+        reasoning = result.get("reasoning", "")
+
+        try:
+            grade = SupportGrade(grade_str)
+        except ValueError:
+            grade = SupportGrade.PARTIALLY_SUPPORTED
+
+        return grade, unsupported, reasoning
+
+    def grade_usefulness(self, query: str, response: str) -> tuple[int, str]:
+        content = f"Query: {query}\n\nResponse:\n{response}"
+        result = self._invoke_json(USEFULNESS_PROMPT, content)
+        score = int(result.get("score", 3))
+        reasoning = result.get("reasoning", "")
+        return max(1, min(5, score)), reasoning
+
+    def transform_query(
+        self, original_query: str, failure_reason: str
+    ) -> tuple[str, str]:
+        content = (
+            f"Original Query: {original_query}\n\n"
+            f"Failure Reason: {failure_reason}\n\n"
+            f"Transform the query to improve retrieval and generation."
+        )
+        result = self._invoke_json(QUERY_TRANSFORM_PROMPT, content)
+        transformed = result.get("transformed_query", original_query)
+        strategy = result.get("strategy_used", "unknown")
+        return transformed, strategy
+
+    # ── Helpers ─────────────────────────────────────────────────────
+
+    def _invoke_json(self, system_prompt: str, user_content: str) -> dict:
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_content),
+            ])
+            # FIX #15: Use centralized JSON extraction
+            raw = extract_json(response.content)
+            return json.loads(raw)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"JSON parsing failed in _invoke_json: {e}")
+            return {}
+
+    def _format_context(self, documents: list[Document]) -> str:
+        formatted = []
+        for i, doc in enumerate(documents, 1):
+            source = doc.metadata.get("source_file", "unknown")
+            page = doc.metadata.get("page", "?")
+            formatted.append(
+                f"[Document {i}] (Source: {source}, Page: {page})\n"
+                f"{doc.page_content}"
+            )
+        return "\n\n---\n\n".join(formatted)
+```
+
+---
+
+## agent/state.py
+
+```python
+# agent/state.py
+
+from typing import TypedDict, Optional, Annotated
+from operator import add
+
+from langchain_core.documents import Document
+from generation.self_rag import RetrievalDecision, RelevanceGrade, SupportGrade
+
+
+class RAGAgentState(TypedDict):
+    query: str
+    original_query: str
+
+    retrieval_decision: Optional[RetrievalDecision]
+    retrieval_reasoning: Optional[str]
+
+    raw_documents: list[tuple[Document, float]]
+    reranked_documents: list[tuple[Document, float, str]]
+    expanded_documents: list[Document]
+    relevant_documents: list[Document]
+
+    revalidation_result: Optional[dict]
+
+    generation: Optional[str]
+
+    relevance_grade: Optional[RelevanceGrade]
+    support_grade: Optional[SupportGrade]
+    support_unsupported_claims: list[str]
+    usefulness_score: Optional[int]
+    usefulness_reasoning: Optional[str]
+
+    num_retries: int
+    max_retries: int
+    transformation_history: Annotated[list[str], add]
+
+    final_answer: Optional[str]
+    is_successful: bool
+    error_message: Optional[str]
+```
+
+---
+
+## agent/rag_agent.py
+
+```python
+# agent/rag_agent.py
+"""
+FIX #4: Separate no-retrieval generation path.
+FIX #10: Read max_retries from state.
+FIX #16: Revalidation routing — insufficient info → transform query.
+FIX #18: Strict support grading.
+"""
+
+import logging
+from typing import Literal
+
+from langgraph.graph import StateGraph, END
+from langchain_core.documents import Document
+
+from config import settings
+from retrieval.hybrid_retriever import HybridRetriever
+from retrieval.reranker import GemmaReranker
+from retrieval.parent_expander import ParentExpander
+from generation.self_rag import SelfRAG, RetrievalDecision, RelevanceGrade, SupportGrade
+from .state import RAGAgentState
+
+logger = logging.getLogger(__name__)
+
+
+class AgenticRAGAgent:
+    """
+    Full Agentic RAG pipeline with LangGraph.
+
+    Graph:
+        route_query ──→ [no_retrieval] → generate_general → evaluate_general → END
+                      └→ [retrieve] → hybrid_retrieve → rerank → expand_parents
+                        → revalidate → [insufficient] → transform_query → hybrid_retrieve
+                                     → [sufficient] → grade_relevance
+                        → [irrelevant] → transform_query
+                        → [relevant] → generate_rag → evaluate
+                        → [pass] → END
+                        → [fail] → transform_query → hybrid_retrieve
+                        → [max_retries] → END
+    """
+
+    def __init__(
+        self,
+        hybrid_retriever: HybridRetriever,
+        reranker: GemmaReranker,
+        parent_expander: ParentExpander,
+        self_rag: SelfRAG,
+    ):
+        self.retriever = hybrid_retriever
+        self.reranker = reranker
+        self.expander = parent_expander
+        self.self_rag = self_rag
+        self.max_retries = settings.max_retries
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        workflow = StateGraph(RAGAgentState)
+
+        # ── Nodes ───────────────────────────────────────────────────
+        workflow.add_node("route_query", self._route_query)
+        workflow.add_node("hybrid_retrieve", self._hybrid_retrieve)
+        workflow.add_node("rerank", self._rerank)
+        workflow.add_node("expand_parents", self._expand_parents)
+        workflow.add_node("revalidate", self._revalidate)
+        workflow.add_node("grade_relevance", self._grade_relevance)
+        workflow.add_node("generate_rag", self._generate_rag)
+        workflow.add_node("generate_general", self._generate_general)
+        workflow.add_node("evaluate_rag", self._evaluate_rag)
+        workflow.add_node("evaluate_general", self._evaluate_general)
+        workflow.add_node("transform_query", self._transform_query)
+
+        workflow.set_entry_point("route_query")
+
+        # ── Edges ───────────────────────────────────────────────────
+        # route → retrieve or general generation
+        workflow.add_conditional_edges(
+            "route_query",
+            self._should_retrieve,
+            {
+                "retrieve": "hybrid_retrieve",
+                "no_retrieval": "generate_general",
+            },
+        )
+
+        # Retrieve → Rerank → Expand → Revalidate
+        workflow.add_edge("hybrid_retrieve", "rerank")
+        workflow.add_edge("rerank", "expand_parents")
+        workflow.add_edge("expand_parents", "revalidate")
+
+        # FIX #16: Revalidation conditional routing
+        workflow.add_conditional_edges(
+            "revalidate",
+            self._check_revalidation,
+            {
+                "sufficient": "grade_relevance",
+                "insufficient": "transform_query",
+            },
+        )
+
+        # Grade Relevance → generate or transform
+        workflow.add_conditional_edges(
+            "grade_relevance",
+            self._check_relevance,
+            {
+                "relevant": "generate_rag",
+                "irrelevant": "transform_query",
+            },
+        )
+
+        # RAG generation → evaluation
+        workflow.add_edge("generate_rag", "evaluate_rag")
+
+        # General generation → general evaluation → END
+        workflow.add_edge("generate_general", "evaluate_general")
+        workflow.add_edge("evaluate_general", END)
+
+        # RAG evaluation → pass/fail/max_retries
+        workflow.add_conditional_edges(
+            "evaluate_rag",
+            self._check_evaluation,
+            {
+                "pass": END,
+                "fail": "transform_query",
+                "max_retries": END,
+            },
+        )
+
+        # Transform → back to retrieve
+        workflow.add_edge("transform_query", "hybrid_retrieve")
+
+        return workflow.compile()
+
+    # ── Node Implementations ────────────────────────────────────────
+
+    def _route_query(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        decision, reasoning = self.self_rag.decide_retrieval(query)
+        logger.info(
+            f"Retrieval decision for '{query[:50]}...': "
+            f"{decision.value} — {reasoning}"
+        )
+        return {
+            "retrieval_decision": decision,
+            "retrieval_reasoning": reasoning,
+            "original_query": state.get("original_query", query),
+        }
+
+    def _hybrid_retrieve(self, state: RAGAgentState) -> dict:
+        results = self.retriever.retrieve(query=state["query"])
+        return {"raw_documents": results}
+
+    def _rerank(self, state: RAGAgentState) -> dict:
+        raw_docs = state.get("raw_documents", [])
+        if not raw_docs:
+            return {"reranked_documents": []}
+        reranked = self.reranker.rerank(query=state["query"], documents=raw_docs)
+        return {"reranked_documents": reranked}
+
+    def _expand_parents(self, state: RAGAgentState) -> dict:
+        reranked = state.get("reranked_documents", [])
+        child_results = [(doc, score) for doc, score, _ in reranked]
+        expanded = self.expander.expand(child_results)
+        return {"expanded_documents": expanded}
+
+    def _revalidate(self, state: RAGAgentState) -> dict:
+        """FIX #16: Re-validate and store result for routing."""
+        query = state["query"]
+        documents = state.get("expanded_documents", [])
+
+        if len(documents) < 2:
+            return {"revalidation_result": {"sufficient_information": True, "contradictions_found": False}}
+
+        result = self.reranker.revalidate(query=query, documents=documents)
+        logger.info(
+            f"Re-validation: sufficient={result.get('sufficient_information')}, "
+            f"contradictions={result.get('contradictions_found')}"
+        )
+        return {"revalidation_result": result}
+
+    def _grade_relevance(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        documents = state.get("expanded_documents", [])
+        # FIX #12: Use batch relevance grading
+        grade, relevant_docs, reasoning = self.self_rag.grade_relevance_batch(
+            query, documents
+        )
+        logger.info(f"Relevance: {grade.value} — {reasoning}")
+        return {"relevance_grade": grade, "relevant_documents": relevant_docs}
+
+    def _generate_rag(self, state: RAGAgentState) -> dict:
+        """FIX #4: Generate grounded in documents."""
+        query = state["query"]
+        documents = state.get("relevant_documents") or state.get("expanded_documents", [])
+        generation = self.self_rag.generate_with_docs(query, documents)
+        return {"generation": generation}
+
+    def _generate_general(self, state: RAGAgentState) -> dict:
+        """FIX #4: Generate without documents (no-retrieval path)."""
+        query = state["query"]
+        generation = self.self_rag.generate_general(query)
+        return {"generation": generation}
+
+    def _evaluate_rag(self, state: RAGAgentState) -> dict:
+        """
+        Evaluate RAG-generated response: support + usefulness.
+        FIX #4: Only run support grading when documents exist.
+        FIX #18: Strict support grading by default.
+        FIX #10: Read max_retries from state.
+        """
+        query = state["query"]
+        generation = state.get("generation", "")
+        documents = state.get("relevant_documents") or state.get("expanded_documents", [])
+        num_retries = state.get("num_retries", 0)
+
+        # ── Grade Support ───────────────────────────────────────────
+        support_grade, unsupported, support_reasoning = self.self_rag.grade_support(
+            query, generation, documents
+        )
+        logger.info(f"Support: {support_grade.value} — {support_reasoning}")
+
+        # ── Grade Usefulness ────────────────────────────────────────
+        usefulness_score, usefulness_reasoning = self.self_rag.grade_usefulness(
+            query, generation
+        )
+        logger.info(f"Usefulness: {usefulness_score}/5 — {usefulness_reasoning}")
+
+        # ── Determine Success ───────────────────────────────────────
+        # FIX #18: Strict support — PARTIALLY_SUPPORTED fails unless configured otherwise
+        if settings.strict_support:
+            support_pass = (
+                support_grade == SupportGrade.FULLY_SUPPORTED
+                and not unsupported
+            )
+        else:
+            support_pass = support_grade in (
+                SupportGrade.FULLY_SUPPORTED,
+                SupportGrade.PARTIALLY_SUPPORTED,
+            )
+
+        usefulness_pass = usefulness_score >= settings.usefulness_min_score
+        is_successful = support_pass and usefulness_pass
+
+        if is_successful:
+            final_answer = generation
+        elif num_retries >= state.get("max_retries", self.max_retries):
+            final_answer = generation  # Best effort
+            is_successful = False
+        else:
+            final_answer = None
+
+        return {
+            "support_grade": support_grade,
+            "support_unsupported_claims": unsupported,
+            "usefulness_score": usefulness_score,
+            "usefulness_reasoning": usefulness_reasoning,
+            "final_answer": final_answer,
+            "is_successful": is_successful,
+        }
+
+    def _evaluate_general(self, state: RAGAgentState) -> dict:
+        """
+        FIX #4: Evaluate general (no-retrieval) responses.
+        Only checks usefulness — no support grading since no documents.
+        """
+        query = state["query"]
+        generation = state.get("generation", "")
+
+        usefulness_score, usefulness_reasoning = self.self_rag.grade_usefulness(
+            query, generation
+        )
+
+        is_successful = usefulness_score >= settings.usefulness_min_score
+
+        return {
+            "support_grade": SupportGrade.FULLY_SUPPORTED,  # N/A for general
+            "support_unsupported_claims": [],
+            "usefulness_score": usefulness_score,
+            "usefulness_reasoning": usefulness_reasoning,
+            "final_answer": generation,
+            "is_successful": is_successful,
+        }
+
+    def _transform_query(self, state: RAGAgentState) -> dict:
+        query = state["query"]
+        num_retries = state.get("num_retries", 0)
+
+        # Build failure reason
+        support_grade = state.get("support_grade")
+        usefulness_score = state.get("usefulness_score", 3)
+        relevance_grade = state.get("relevance_grade")
+        revalidation = state.get("revalidation_result", {})
+
+        failure_parts = []
+        if revalidation and not revalidation.get("sufficient_information", True):
+            failure_parts.append("Retrieved documents contain insufficient information")
+        if revalidation and revalidation.get("contradictions_found"):
+            failure_parts.append("Retrieved documents contain contradictions")
+        if relevance_grade == RelevanceGrade.IRRELEVANT:
+            failure_parts.append("Retrieved documents were irrelevant to the query")
+        if support_grade == SupportGrade.NO_SUPPORT:
+            failure_parts.append("Generated response was not supported by documents")
+        if support_grade == SupportGrade.PARTIALLY_SUPPORTED and settings.strict_support:
+            failure_parts.append("Generated response was only partially supported")
+        if usefulness_score and usefulness_score < settings.usefulness_min_score:
+            failure_parts.append(f"Response usefulness was low ({usefulness_score}/5)")
+
+        failure_reason = "; ".join(failure_parts) or "Previous attempt failed"
+
+        transformed_query, strategy = self.self_rag.transform_query(query, failure_reason)
+        logger.info(
+            f"Query transformed (retry {num_retries + 1}): "
+            f"'{query[:50]}...' → '{transformed_query[:50]}...' "
+            f"(strategy: {strategy})"
+        )
+
+        return {
+            "query": transformed_query,
+            "num_retries": num_retries + 1,
+            "transformation_history": [f"{strategy}: {transformed_query}"],
+        }
+
+    # ── Conditional Edges ───────────────────────────────────────────
+
+    def _should_retrieve(
+        self, state: RAGAgentState
+    ) -> Literal["retrieve", "no_retrieval"]:
+        decision = state.get("retrieval_decision", RetrievalDecision.RETRIEVE)
+        return "retrieve" if decision == RetrievalDecision.RETRIEVE else "no_retrieval"
+
+    def _check_revalidation(
+        self, state: RAGAgentState
+    ) -> Literal["sufficient", "insufficient"]:
+        """
+        FIX #16: Route based on revalidation result.
+        Insufficient info → transform query and retry.
+        """
+        result = state.get("revalidation_result", {})
+        sufficient = result.get("sufficient_information", True)
+        contradictions = result.get("contradictions_found", False)
+
+        if not sufficient or contradictions:
+            logger.info(
+                f"Revalidation routing: insufficient={not sufficient}, "
+                f"contradictions={contradictions} → transform query"
+            )
+            return "insufficient"
+        return "sufficient"
+
+    def _check_relevance(
+        self, state: RAGAgentState
+    ) -> Literal["relevant", "irrelevant"]:
+        grade = state.get("relevance_grade", RelevanceGrade.RELEVANT)
+        return "relevant" if grade == RelevanceGrade.RELEVANT else "irrelevant"
+
+    def _check_evaluation(
+        self, state: RAGAgentState
+    ) -> Literal["pass", "fail", "max_retries"]:
+        if state.get("is_successful"):
+            return "pass"
+        num_retries = state.get("num_retries", 0)
+        # FIX #10: Read max_retries from state
+        if num_retries >= state.get("max_retries", self.max_retries):
+            logger.warning(f"Max retries ({num_retries}) reached. Returning best effort.")
+            return "max_retries"
+        return "fail"
+
+    # ── Public Interface ────────────────────────────────────────────
+
+    def invoke(self, query: str) -> dict:
+        initial_state = {
+            "query": query,
+            "original_query": query,
+            "raw_documents": [],
+            "reranked_documents": [],
+            "expanded_documents": [],
+            "relevant_documents": [],
+            "revalidation_result": None,
+            "generation": None,
+            "retrieval_decision": None,
+            "retrieval_reasoning": None,
+            "relevance_grade": None,
+            "support_grade": None,
+            "support_unsupported_claims": [],
+            "usefulness_score": None,
+            "usefulness_reasoning": None,
+            "num_retries": 0,
+            "max_retries": self.max_retries,
+            "transformation_history": [],
+            "final_answer": None,
+            "is_successful": False,
+            "error_message": None,
+        }
+
+        result = self.graph.invoke(initial_state)
+
+        return {
+            "answer": result.get("final_answer") or result.get("generation", ""),
+            "is_successful": result.get("is_successful", False),
+            "retrieval_decision": result.get("retrieval_decision"),
+            "relevance_grade": result.get("relevance_grade"),
+            "support_grade": result.get("support_grade"),
+            "usefulness_score": result.get("usefulness_score"),
+            "documents": result.get("relevant_documents") or result.get("expanded_documents", []),
+            "num_retries": result.get("num_retries", 0),
+            "transformations": result.get("transformation_history", []),
+            "revalidation": result.get("revalidation_result"),
+        }
+```
+
+---
+
+## pipeline.py
+
+```python
+# pipeline.py
+"""
+FIX #3: reset() re-creates Qdrant collection.
+FIX #7: Persistent SQLite stores.
+FIX #17: Deduplication on re-ingestion.
+"""
+
+import logging
+from pathlib import Path
+from typing import Union
+
+from config import settings
+from ingestion.pdf_parser import PDFParser, ParsedPage
+from ingestion.docx_parser import DocxParser
+from chunking.agentic_chunker import AgenticChunker
+from storage.vector_store import QdrantVectorStore
+from storage.parent_store import ParentDocumentStore
+from storage.bm25_store import BM25Store
+from retrieval.hybrid_retriever import HybridRetriever
+from retrieval.reranker import GemmaReranker
+from retrieval.parent_expander import ParentExpander
+from generation.self_rag import SelfRAG
+from agent.rag_agent import AgenticRAGAgent
+from utils import compute_file_hash
+
+logger = logging.getLogger(__name__)
+
+
+class AgenticRAGPipeline:
+    """Complete Agentic RAG pipeline manager with persistent state."""
+
+    def __init__(self, index_dir: str = None):
+        if index_dir:
+            settings.index_dir = index_dir
+        Path(settings.index_dir).mkdir(parents=True, exist_ok=True)
+
+        # ── Ingestion ───────────────────────────────────────────────
+        self.pdf_parser = PDFParser()
+        self.docx_parser = DocxParser()
+
+        # ── Chunking ────────────────────────────────────────────────
+        self.chunker = AgenticChunker()
+
+        # ── Storage (persistent) ────────────────────────────────────
+        self.vector_store = QdrantVectorStore()
+        self.parent_store = ParentDocumentStore()  # SQLite-backed
+        self.bm25_store = BM25Store()               # SQLite-backed
+
+        # ── Retrieval ───────────────────────────────────────────────
+        self.hybrid_retriever = HybridRetriever(
+            vector_store=self.vector_store,
+            bm25_store=self.bm25_store,
+        )
+        self.reranker = GemmaReranker()
+        self.parent_expander = ParentExpander(parent_store=self.parent_store)
+
+        # ── Generation ──────────────────────────────────────────────
+        self.self_rag = SelfRAG()
+
+        # ── Agent ───────────────────────────────────────────────────
+        self.agent = AgenticRAGAgent(
+            hybrid_retriever=self.hybrid_retriever,
+            reranker=self.reranker,
+            parent_expander=self.parent_expander,
+            self_rag=self.self_rag,
+        )
+
+    # ── Ingest & Index ──────────────────────────────────────────────
+
+    def ingest(self, file_paths: list[Union[str, Path]]) -> dict:
+        """
+        Ingest documents: Parse → Chunk → Store.
+        FIX #17: Deduplication — removes old chunks for re-ingested files.
+        """
+        all_pages: list[ParsedPage] = []
+        file_hashes: dict[str, str] = {}
+
+        for file_path in file_paths:
+            file_path = Path(file_path)
+            ext = file_path.suffix.lower()
+
+            try:
+                if ext == ".pdf":
+                    pages, fhash = self.pdf_parser.parse(file_path)
+                elif ext == ".docx":
+                    pages, fhash = self.docx_parser.parse(file_path)
+                elif ext == ".doc":
+                    logger.error(
+                        f"Legacy .doc format not supported: {file_path.name}. "
+                        f"Convert to .docx first."
+                    )
+                    continue
+                else:
+                    logger.warning(f"Unsupported file type: {ext}")
+                    continue
+
+                file_hashes[str(file_path)] = fhash
+
+                # FIX #17: Remove old chunks for this file before re-ingesting
+                self._delete_existing_chunks(fhash)
+
+                all_pages.extend(pages)
+            except Exception as e:
+                logger.error(f"Failed to parse {file_path}: {e}")
+                continue
+
+        if not all_pages:
+            return {"files_processed": 0, "error": "No pages parsed"}
+
+        logger.info(f"Parsed {len(all_pages)} total pages")
+
+        # Use the first file's hash (or merge all)
+        primary_hash = next(iter(file_hashes.values()), "unknown")
+
+        chunked = self.chunker.chunk_document(all_pages, primary_hash)
+
+        # Store
+        self.parent_store.add_documents(chunked.parent_chunks)
+        self.vector_store.add_documents(chunked.child_chunks)
+        self.bm25_store.add_documents(chunked.child_chunks)
+
+        stats = {
+            "files_processed": len(file_paths),
+            "total_pages": len(all_pages),
+            "parent_chunks": len(chunked.parent_chunks),
+            "child_chunks": len(chunked.child_chunks),
+            "relations": len(chunked.relations),
+            "file_hashes": file_hashes,
+        }
+
+        logger.info(f"Ingestion complete: {stats}")
+        return stats
+
+    def _delete_existing_chunks(self, file_hash: str) -> None:
+        """Remove old chunks for a file hash before re-ingestion."""
+        deleted_parents = self.parent_store.delete_by_file_hash(file_hash)
+        deleted_bm25 = self.bm25_store.delete_by_file_hash(file_hash)
+        self.vector_store.delete_by_file_hash(file_hash)
+        if deleted_parents > 0 or deleted_bm25 > 0:
+            logger.info(
+                f"Removed old chunks for file_hash={file_hash[:12]}...: "
+                f"{deleted_parents} parents, {deleted_bm25} BM25 docs"
+            )
+
+    # ── Query ───────────────────────────────────────────────────────
+
+    def query(self, question: str) -> dict:
+        return self.agent.invoke(question)
+
+    # ── Status ──────────────────────────────────────────────────────
+
+    def status(self) -> dict:
+        """Get current index status."""
+        return {
+            "qdrant_points": self.vector_store.count(),
+            "parent_chunks": self.parent_store.count(),
+            "bm25_documents": self.bm25_store.count(),
+        }
+
+    # ── Reset ───────────────────────────────────────────────────────
+
+    def reset(self):
+        """
+        FIX #3: Properly reset all stores.
+        """
+        self.vector_store.delete_collection()
+        self.vector_store._ensure_collection()  # FIX #3: Recreate immediately
+        self.parent_store.close()
+        self.bm25_store.close()
+
+        # Delete SQLite DB
+        db_path = settings.db_path
+        if db_path.exists():
+            db_path.unlink()
+
+        # Recreate stores
+        self.parent_store = ParentDocumentStore()
+        self.bm25_store = BM25Store()
+
+        logger.info("Pipeline reset complete")
+
+    def close(self):
+        """Close all connections."""
+        self.parent_store.close()
+        self.bm25_store.close()
+```
+
+---
+
+## main.py
+
+```python
+# main.py
+"""
+FIX #17: Shared pipeline state across CLI commands.
+Pipeline loads from persistent SQLite + Qdrant on each command.
+"""
+
+import argparse
+import logging
+import sys
+
+from pipeline import AgenticRAGPipeline
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("agentic_rag.log"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+def get_pipeline(index_dir: str = None) -> AgenticRAGPipeline:
+    """
+    FIX #17: Create/load pipeline with persistent state.
+    Qdrant vectors + SQLite parent/BM25 data survive across commands.
+    """
+    return AgenticRAGPipeline(index_dir=index_dir)
+
+
+def cmd_ingest(args):
+    pipeline = get_pipeline(args.index_dir)
+    stats = pipeline.ingest(args.files)
+    print("\n✅ Ingestion Complete!")
+    print(f"   Files: {stats['files_processed']}")
+    print(f"   Pages: {stats['total_pages']}")
+    print(f"   Parent chunks: {stats['parent_chunks']}")
+    print(f"   Child chunks: {stats['child_chunks']}")
+
+    status = pipeline.status()
+    print(f"\n   Index status:")
+    print(f"   Qdrant points: {status['qdrant_points']}")
+    print(f"   Parent chunks: {status['parent_chunks']}")
+    print(f"   BM25 documents: {status['bm25_documents']}")
+
+    pipeline.close()
+
+
+def cmd_query(args):
+    pipeline = get_pipeline(args.index_dir)
+
+    # FIX #17: Check that index is loaded
+    status = pipeline.status()
+    if status["qdrant_points"] == 0:
+        print("⚠️  Warning: Qdrant has no vectors. Did you run `ingest` first?")
+    if status["parent_chunks"] == 0:
+        print("⚠️  Warning: No parent chunks loaded. Parent expansion will fail.")
+    if status["bm25_documents"] == 0:
+        print("⚠️  Warning: BM25 index is empty. Retrieval is vector-only.")
+
+    result = pipeline.query(args.question)
+
+    print("\n" + "=" * 80)
+    print("📝 ANSWER")
+    print("=" * 80)
+    print(result["answer"])
+
+    print("\n" + "-" * 80)
+    print("📊 EVALUATION")
+    print("-" * 80)
+    print(f"  Successful: {result['is_successful']}")
+    print(f"  Retrieval: {result['retrieval_decision']}")
+    print(f"  Relevance: {result['relevance_grade']}")
+    print(f"  Support: {result['support_grade']}")
+    print(f"  Usefulness: {result['usefulness_score']}/5")
+    print(f"  Retries: {result['num_retries']}")
+
+    if result["transformations"]:
+        print("  Query Transformations:")
+        for t in result["transformations"]:
+            print(f"    - {t}")
+
+    if result["documents"]:
+        print(f"\n📄 SOURCES ({len(result['documents'])} documents)")
+        for i, doc in enumerate(result["documents"][:5], 1):
+            source = doc.metadata.get("source_file", "unknown")
+            page = doc.metadata.get("page", "?")
+            print(f"  [{i}] {source} (page {page})")
+
+    pipeline.close()
+
+
+def cmd_interactive(args):
+    pipeline = get_pipeline(args.index_dir)
+
+    status = pipeline.status()
+    print(f"\n🤖 Agentic RAG — Interactive Mode")
+    print(f"   Qdrant: {status['qdrant_points']} points | "
+          f"Parents: {status['parent_chunks']} | "
+          f"BM25: {status['bm25_documents']} docs")
+    print("Type 'quit' to exit, 'reset' to clear data, 'status' for info\n")
+
+    while True:
+        try:
+            question = input("❓ Query: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            break
+
+        if not question:
+            continue
+        if question.lower() == "quit":
+            break
+        if question.lower() == "reset":
+            pipeline.reset()
+            print("🗑️  Pipeline reset.\n")
+            continue
+        if question.lower() == "status":
+            s = pipeline.status()
+            print(f"   Qdrant: {s['qdrant_points']} | "
+                  f"Parents: {s['parent_chunks']} | "
+                  f"BM25: {s['bm25_documents']}\n")
+            continue
+
+        result = pipeline.query(question)
+        print(f"\n💡 {result['answer']}")
+        print(
+            f"   [✓ Success: {result['is_successful']} | "
+            f"Support: {result['support_grade']} | "
+            f"Usefulness: {result['usefulness_score']}/5 | "
+            f"Retries: {result['num_retries']}]"
+        )
+        print()
+
+    pipeline.close()
+
+
+def cmd_status(args):
+    pipeline = get_pipeline(args.index_dir)
+    status = pipeline.status()
+    print("\n📊 Index Status")
+    print(f"   Qdrant points:   {status['qdrant_points']}")
+    print(f"   Parent chunks:   {status['parent_chunks']}")
+    print(f"   BM25 documents:  {status['bm25_documents']}")
+
+    if status["qdrant_points"] == 0:
+        print("\n   ⚠️  Index is empty. Run `python main.py ingest --files ...` first.")
+    elif status["parent_chunks"] == 0 or status["bm25_documents"] == 0:
+        print("\n   ⚠️  Index is partial. Some stores are empty (persistence issue?).")
+
+    pipeline.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Agentic RAG System")
+    parser.add_argument(
+        "--index-dir", default=None,
+        help="Directory for persistent index data (default: ./index_data)"
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Ingest
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest documents")
+    ingest_parser.add_argument("--files", nargs="+", required=True)
+
+    # Query
+    query_parser = subparsers.add_parser("query", help="Query the RAG system")
+    query_parser.add_argument("question", type=str)
+
+    # Interactive
+    subparsers.add_parser("interactive", help="Interactive query mode")
+
+    # Status
+    subparsers.add_parser("status", help="Show index status")
+
+    args = parser.parse_args()
+
+    if args.command == "ingest":
+        cmd_ingest(args)
+    elif args.command == "query":
+        cmd_query(args)
+    elif args.command == "interactive":
+        cmd_interactive(args)
+    elif args.command == "status":
+        cmd_status(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Updated Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    AGENTIC RAG — CORRECTED ARCHITECTURE                   │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PERSISTENCE LAYER                                                       │
+│  ┌──────────────┐  ┌──────────────────────────────────────────┐         │
+│  │   Qdrant     │  │              SQLite                      │         │
+│  │  (Vectors)   │  │  ┌─────────────┐  ┌──────────────────┐  │         │
+│  │              │  │  │parent_chunks│  │ bm25_documents   │  │         │
+│  │ Child chunks │  │  │ (doc_id PK) │  │ (doc_id PK)      │  │         │
+│  │ + embeddings │  │  │ + text      │  │ + text           │  │         │
+│  │              │  │  │ + metadata  │  │ + metadata        │  │         │
+│  └──────────────┘  │  │ + file_hash │  │ + file_hash      │  │         │
+│                    │  └─────────────┘  └──────────────────┘  │         │
+│                    └──────────────────────────────────────────┘         │
+│                                                                          │
+│  GRAPH FLOW (with all fixes)                                             │
+│                                                                          │
+│  route_query ─┬─[no_retrieval]→ generate_general → evaluate_general→END │
+│               │                              (usefulness only)           │
+│               │                                                          │
+│               └─[retrieve]→ hybrid_retrieve → rerank → expand_parents   │
+│                               ↑                │                         │
+│                               │          revalidate                     │
+│                               │           ├─[insufficient]→ transform───┤
+│                               │           └─[sufficient]               │
+│                               │                    │                    │
+│                               │            grade_relevance             │
+│                               │             ├─[irrelevant]→ transform──┤
+│                               │             └─[relevant]              │
+│                               │                    │                    │
+│                               │            generate_rag                │
+│                               │                    │                    │
+│                               │            evaluate_rag                │
+│                               │             ├─[pass]→ END              │
+│                               │             ├─[fail]→ transform────────┤
+│                               │             └─[max_retries]→ END      │
+│                               └────────────────────────────────────────┘
+│                                                                          │
+│  KEY FIXES APPLIED                                                       │
+│  ✅ SequenceMatcher replaces broken difflib.get_close_matches             │
+│  ✅ Progress guard prevents infinite chunker loops                        │
+│  ✅ Deterministic uuid5 IDs (no negative hash)                           │
+│  ✅ SQLite persistence for parents + BM25                                │
+│  ✅ Revalidation controls graph routing                                  │
+│  ✅ Separate general vs RAG generation paths                             │
+│  ✅ Batch relevance grading (1 call instead of N)                        │
+│  ✅ Strict support grading (configurable)                                │
+│  ✅ Rate-limit backoff on Gemini VLM calls                              │
+│  ✅ Smart VLM OCR (skip when native text sufficient)                     │
+│  ✅ DOCX in-order body iteration + page estimation                       │
+│  ✅ Parent expander tracks max child score                               │
+│  ✅ Deduplication via file_hash on re-ingestion                          │
+│  ✅ Centralized JSON extraction with regex                               │
+│  ✅ Copy Qdrant payload instead of mutating                             │
+│  ✅ reset() recreates Qdrant collection                                  │
+│  ✅ state["max_retries"] actually read                                   │
+│  ✅ CLI shares state across commands via SQLite+Qdrant                   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
