@@ -207,6 +207,31 @@ def test_pipeline_delete_by_source_id():
     print("OK source_id deletion lifecycle")
 
 
+def test_strict_document_only_routing():
+    from generation.self_rag import (
+        SelfRAG,
+        RetrievalDecision,
+        NOT_IN_CONTEXT_MESSAGE,
+        GREETING_REPLY,
+        is_small_talk,
+    )
+
+    assert is_small_talk("Hi")
+    assert is_small_talk("Hello!")
+    assert not is_small_talk("Who are you?")
+
+    rag = SelfRAG.__new__(SelfRAG)
+    d, _ = SelfRAG.decide_retrieval(rag, "Who are you?")
+    assert d == RetrievalDecision.RETRIEVE
+    d2, _ = SelfRAG.decide_retrieval(rag, "Hi")
+    assert d2 == RetrievalDecision.NO_RETRIEVAL
+
+    assert SelfRAG.generate_general(rag, "Who are you?") == NOT_IN_CONTEXT_MESSAGE
+    assert SelfRAG.generate_general(rag, "Hi") == GREETING_REPLY
+    assert SelfRAG.generate_with_docs(rag, "test", []) == NOT_IN_CONTEXT_MESSAGE
+    print("OK strict document-only routing")
+
+
 def test_grade_usefulness_default():
     from generation.self_rag import SelfRAG
 
@@ -240,6 +265,7 @@ def main():
         test_chunking_factory,
         test_chunker_table_columns,
         test_pipeline_delete_by_source_id,
+        test_strict_document_only_routing,
         test_grade_usefulness_default,
     ]
     failed = 0

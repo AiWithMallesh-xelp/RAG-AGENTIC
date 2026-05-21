@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     support_threshold: float = 0.6
     usefulness_min_score: int = 3
     strict_support: bool = True
+    # Answer only from uploaded docs; refuse general knowledge (e.g. "Who are you?")
+    strict_document_only: bool = Field(
+        default=True, alias="STRICT_DOCUMENT_ONLY"
+    )
 
     # ── VLM OCR ────────────────────────────────────────────────────
     vlm_enabled: bool = Field(default=True, alias="VLM_ENABLED")

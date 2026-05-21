@@ -10,6 +10,7 @@ FIX #9: Remove dead code.
 
 import json
 import logging
+import re
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
@@ -22,6 +23,30 @@ from config import settings
 from utils import parse_llm_json
 
 logger = logging.getLogger(__name__)
+
+NOT_IN_CONTEXT_MESSAGE = (
+    "The provided documents do not contain information to answer this question. "
+    "Please ask about content from your uploaded files."
+)
+
+GREETING_REPLY = (
+    "Hello! I can answer questions based on your uploaded documents only. "
+    "What would you like to know?"
+)
+
+_SMALL_TALK_RE = re.compile(
+    r"^\s*(hi|hello|hey|howdy|greetings|good\s+(morning|afternoon|evening)|"
+    r"thanks|thank\s+you|bye|goodbye|ok|okay|yo)[\s!.?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_small_talk(query: str) -> bool:
+    """True for brief greetings/thanks — the only no-retrieval case in strict mode."""
+    q = query.strip()
+    if not q or len(q) > 80:
+        return False
+    return bool(_SMALL_TALK_RE.match(q))
 
 
 class RetrievalDecision(str, Enum):
@@ -56,11 +81,12 @@ class SelfRAGResult:
 
 # ── Prompts ─────────────────────────────────────────────────────────
 
-RETRIEVAL_DECISION_PROMPT = """You are a retrieval decision agent. Given a query, determine if external knowledge retrieval is needed.
+RETRIEVAL_DECISION_PROMPT = """You are a retrieval decision agent for a document-only Q&A system.
 
 Rules:
-- If the query requires specific facts, data, or information → RETRIEVE
-- If the query is about general knowledge, greetings, or simple reasoning → NO_RETRIEVAL
+- If the query asks about facts, concepts, people, systems, or anything that could appear in uploaded files → RETRIEVE
+- ONLY use no_retrieval for brief greetings or thanks (e.g. "hi", "hello", "thanks")
+- Identity questions ("who are you"), general knowledge, and chit-chat → RETRIEVE (documents likely lack an answer; do not use outside knowledge)
 - When in doubt, choose RETRIEVE
 
 Respond ONLY with valid JSON:
@@ -134,29 +160,18 @@ Respond ONLY with valid JSON:
 }
 """
 
-RAG_GENERATION_PROMPT = """You are a helpful, accurate AI assistant. Answer the user's query based ONLY on the provided context documents.
+RAG_GENERATION_PROMPT = """You are a document-only Q&A assistant. You may ONLY use the context below.
 
 Rules:
-1. Use ONLY information from the provided context
-2. If the context doesn't contain enough information, say "I don't have sufficient information to fully answer this question"
-3. Cite specific parts of the context when making claims
-4. Be precise and avoid speculation
-5. Structure your answer clearly
+1. Use ONLY information explicitly stated in the context documents
+2. Do NOT use outside knowledge, training data, or assumptions
+3. If the context does not contain enough information to answer the query, respond with EXACTLY this sentence and nothing else:
+   "The provided documents do not contain information to answer this question. Please ask about content from your uploaded files."
+4. When you can answer, cite the document (source/page) for major claims
+5. Do not describe yourself as a Google model or general-purpose AI
 
 Context Documents:
 {context}
-
-User Query: {query}
-
-Provide a comprehensive, accurate answer:
-"""
-
-GENERAL_GENERATION_PROMPT = """You are a helpful, accurate AI assistant. Answer the user's query using your general knowledge.
-
-Rules:
-1. Be accurate and helpful
-2. If you're unsure, say so
-3. Structure your answer clearly
 
 User Query: {query}
 
@@ -173,6 +188,17 @@ class SelfRAG:
     def decide_retrieval(
         self, query: str
     ) -> tuple[RetrievalDecision, str]:
+        if settings.strict_document_only:
+            if is_small_talk(query):
+                return (
+                    RetrievalDecision.NO_RETRIEVAL,
+                    "Greeting or thanks — no document lookup",
+                )
+            return (
+                RetrievalDecision.RETRIEVE,
+                "Strict document-only mode — must check indexed files",
+            )
+
         response = self._invoke_json(
             RETRIEVAL_DECISION_PROMPT, f"Query: {query}"
         )
@@ -258,26 +284,61 @@ class SelfRAG:
         self, query: str, documents: list[Document]
     ) -> str:
         """Generate response grounded in documents."""
+        if not documents:
+            return NOT_IN_CONTEXT_MESSAGE
+
         context = self._format_context(documents)
+        if not context.strip():
+            return NOT_IN_CONTEXT_MESSAGE
+
         prompt = RAG_GENERATION_PROMPT.format(context=context, query=query)
         response = self.llm.invoke(
             [
-                SystemMessage(content="You are a precise, factual assistant."),
+                SystemMessage(
+                    content=(
+                        "You answer only from provided documents. "
+                        "Never use general knowledge."
+                    )
+                ),
                 HumanMessage(content=prompt),
             ]
         )
-        return response.content
+        text = (response.content or "").strip()
+        if settings.strict_document_only and self._looks_like_general_knowledge(
+            text, query
+        ):
+            return NOT_IN_CONTEXT_MESSAGE
+        return text
 
     def generate_general(self, query: str) -> str:
-        """Generate response using general knowledge (no documents)."""
-        prompt = GENERAL_GENERATION_PROMPT.format(query=query)
-        response = self.llm.invoke(
-            [
-                SystemMessage(content="You are a helpful, accurate assistant."),
-                HumanMessage(content=prompt),
-            ]
+        """No-retrieval path: greetings only in strict mode; never general knowledge."""
+        if settings.strict_document_only:
+            if is_small_talk(query):
+                return GREETING_REPLY
+            return NOT_IN_CONTEXT_MESSAGE
+
+        return NOT_IN_CONTEXT_MESSAGE
+
+    @staticmethod
+    def _looks_like_general_knowledge(answer: str, query: str) -> bool:
+        """Detect answers that ignore document-only rules."""
+        lower = answer.lower()
+        if NOT_IN_CONTEXT_MESSAGE.lower() in lower:
+            return False
+        identity_markers = (
+            "trained by google",
+            "large language model",
+            "language model developed",
+            "i am an ai",
+            "i'm an ai",
+            "as an ai assistant",
         )
-        return response.content
+        if any(m in lower for m in identity_markers):
+            return True
+        q = query.lower().strip()
+        if q in ("who are you?", "who are you", "what are you?"):
+            return True
+        return False
 
     def grade_support(
         self, query: str, response: str, documents: list[Document]

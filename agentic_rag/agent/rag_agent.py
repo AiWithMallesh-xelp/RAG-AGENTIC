@@ -21,7 +21,15 @@ from config import settings
 from retrieval.hybrid_retriever import HybridRetriever
 from retrieval.reranker import GemmaReranker
 from retrieval.parent_expander import ParentExpander
-from generation.self_rag import SelfRAG, RetrievalDecision, RelevanceGrade, SupportGrade
+from generation.self_rag import (
+    SelfRAG,
+    RetrievalDecision,
+    RelevanceGrade,
+    SupportGrade,
+    NOT_IN_CONTEXT_MESSAGE,
+    GREETING_REPLY,
+    is_small_talk,
+)
 from .state import RAGAgentState
 
 logger = logging.getLogger(__name__)
@@ -188,7 +196,15 @@ class AgenticRAGAgent:
             state.get("relevant_documents")
             or state.get("expanded_documents", [])
         )
-        generation = self.self_rag.generate_with_docs(query, documents)
+        relevance = state.get("relevance_grade")
+        if (
+            settings.strict_document_only
+            and relevance == RelevanceGrade.IRRELEVANT
+            and not state.get("relevant_documents")
+        ):
+            generation = NOT_IN_CONTEXT_MESSAGE
+        else:
+            generation = self.self_rag.generate_with_docs(query, documents)
         return {"generation": generation}
 
     def _generate_general(self, state: RAGAgentState) -> dict:
@@ -251,10 +267,23 @@ class AgenticRAGAgent:
         query = state["query"]
         generation = state.get("generation", "")
 
-        usefulness_score, usefulness_reasoning = self.self_rag.grade_usefulness(
-            query, generation
-        )
-        is_successful = usefulness_score >= settings.usefulness_min_score
+        if settings.strict_document_only and generation.strip() in (
+            NOT_IN_CONTEXT_MESSAGE,
+            GREETING_REPLY,
+        ):
+            if generation.strip() == GREETING_REPLY:
+                usefulness_score, usefulness_reasoning = 5, "Greeting handled"
+            else:
+                usefulness_score, usefulness_reasoning = (
+                    5,
+                    "Correctly refused — not in uploaded documents",
+                )
+            is_successful = True
+        else:
+            usefulness_score, usefulness_reasoning = self.self_rag.grade_usefulness(
+                query, generation
+            )
+            is_successful = usefulness_score >= settings.usefulness_min_score
 
         return {
             "support_grade": SupportGrade.FULLY_SUPPORTED,
