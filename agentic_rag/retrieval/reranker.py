@@ -1,21 +1,22 @@
 # retrieval/reranker.py
 """
-Re-ranking with Gemma 4 26B via Ollama.
+LLM-based re-ranking for retrieved documents.
 
-FIX #8: Restore format="json" for reliable JSON output.
-Batch reranking for efficiency.
+Backends (RERANKER_BACKEND in .env):
+- gemini (default): ChatGoogleGenerativeAI via GOOGLE_API_KEY — no local server needed
+- ollama: ChatOllama at OLLAMA_BASE_URL (requires `ollama serve` + RERANKER_MODEL pulled)
 """
 
 import json
 import logging
 from typing import Optional
 
-from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.documents import Document
 
 from config import settings
-from utils import extract_json
+from llm_factory import make_gemini_chat
+from utils import extract_json, parse_llm_json
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +54,11 @@ Respond ONLY with a valid JSON object:
 
 REVALIDATION_PROMPT = """You are a document re-validation agent. Given a query and retrieved documents, determine:
 
-1. Are there contradictions between the documents?
-2. Is the information sufficient to answer the query?
+1. Are there direct factual contradictions between documents (same claim, opposite conclusions)?
+   Minor wording differences or complementary details are NOT contradictions.
+2. Is there enough information in the documents to attempt an answer?
+   Set sufficient_information=true if any document is on-topic, even if the answer would be partial.
+   Set sufficient_information=false only when ALL documents are clearly off-topic or empty of relevant facts.
 3. Which documents are most trustworthy?
 
 Respond ONLY with valid JSON:
@@ -68,18 +72,53 @@ Respond ONLY with valid JSON:
 """
 
 
-class GemmaReranker:
-    """Re-ranker using Gemma 4 26B via Ollama with batch scoring."""
+def _create_reranker_llm():
+    backend = (settings.reranker_backend or "gemini").strip().lower()
+    if backend == "ollama":
+        from langchain_ollama import ChatOllama
 
-    def __init__(self):
-        # FIX #8: Restore format="json" for reliable structured output
-        self.llm = ChatOllama(
+        logger.info(
+            f"Reranker backend=ollama model={settings.reranker_model} "
+            f"url={settings.ollama_base_url}"
+        )
+        return ChatOllama(
             model=settings.reranker_model,
             base_url=settings.ollama_base_url,
             temperature=0.0,
             num_ctx=8192,
             format="json",
         )
+
+    logger.info(f"Reranker backend=gemini model={settings.reranker_model}")
+    return make_gemini_chat(
+        model=settings.reranker_model,
+        temperature=0.0,
+        json_mode=True,
+        max_output_tokens=4096,
+    )
+
+
+def _parse_llm_json_response(content) -> dict:
+    """Parse JSON from Gemini or Ollama response content."""
+    if isinstance(content, dict):
+        return content
+    text = content if isinstance(content, str) else str(content)
+    try:
+        return parse_llm_json(text)
+    except Exception:
+        return json.loads(extract_json(text))
+
+
+class GemmaReranker:
+    """
+    Re-ranker using an LLM to score document relevance.
+
+    Class name kept for compatibility; backend is configured via .env
+    (RERANKER_BACKEND=gemini|ollama, RERANKER_MODEL=...).
+    """
+
+    def __init__(self):
+        self.llm = _create_reranker_llm()
 
     def rerank(
         self,
@@ -93,17 +132,16 @@ class GemmaReranker:
         if not documents:
             return []
 
-        # Try batch scoring first
         batch_scores = self._batch_score(query, documents)
 
         if batch_scores is not None:
             scored_docs = []
-            for i, (doc, orig_score) in enumerate(documents):
+            for i, (doc, _orig_score) in enumerate(documents):
                 score, reasoning = batch_scores.get(i, (5, "batch fallback"))
                 scored_docs.append((doc, score, reasoning))
         else:
             scored_docs = []
-            for doc, orig_score in documents:
+            for doc, _orig_score in documents:
                 score, reasoning = self._score_document(query, doc.page_content)
                 scored_docs.append((doc, score, reasoning))
 
@@ -136,11 +174,9 @@ class GemmaReranker:
                     HumanMessage(content=f"Query: {query}\n{docs_text}"),
                 ]
             )
-            raw = extract_json(response.content)
-            data = json.loads(raw)
+            data = _parse_llm_json_response(response.content)
 
             if isinstance(data, dict) and "grades" not in data:
-                # Might be a single-grade response wrapped in dict
                 if "doc_index" in data:
                     data = {"grades": [data]}
                 else:
@@ -175,7 +211,7 @@ class GemmaReranker:
                     ),
                 ]
             )
-            data = json.loads(extract_json(response.content))
+            data = _parse_llm_json_response(response.content)
             score = max(1, min(10, int(data.get("score", 5))))
             reasoning = data.get("reasoning", "No reasoning provided")
             return score, reasoning
@@ -198,7 +234,7 @@ class GemmaReranker:
                     ),
                 ]
             )
-            return json.loads(extract_json(response.content))
+            return _parse_llm_json_response(response.content)
         except Exception as e:
             logger.warning(f"Re-validation failed: {e}")
             return {

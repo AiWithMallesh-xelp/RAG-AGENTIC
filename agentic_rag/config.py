@@ -26,7 +26,11 @@ class Settings(BaseSettings):
         default="gemini-embedding-001", alias="EMBEDDING_MODEL"
     )
     embedding_dim: int = Field(default=768, alias="EMBEDDING_DIM")
-    reranker_model: str = "gemma4:26b"
+    # Reranker: gemini (API, default) or ollama (local ChatOllama)
+    reranker_backend: str = Field(default="gemini", alias="RERANKER_BACKEND")
+    reranker_model: str = Field(
+        default="gemini-2.5-flash", alias="RERANKER_MODEL"
+    )
 
     # ── Persistence ─────────────────────────────────────────────────
     index_dir: str = Field(default="./index_data", alias="INDEX_DIR")

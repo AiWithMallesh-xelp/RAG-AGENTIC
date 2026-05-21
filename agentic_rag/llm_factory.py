@@ -8,13 +8,14 @@ from config import settings
 
 def make_gemini_chat(
     *,
+    model: str | None = None,
     temperature: float = 0.0,
     json_mode: bool = False,
     max_output_tokens: int = 4096,
 ) -> ChatGoogleGenerativeAI:
     """Build ChatGoogleGenerativeAI with optional JSON response mode."""
     kwargs = {
-        "model": settings.llm_model,
+        "model": model or settings.llm_model,
         "google_api_key": settings.google_api_key,
         "temperature": temperature,
         "max_output_tokens": max_output_tokens,

@@ -313,6 +313,9 @@ def run_app():
     print(f"  http://{settings.flask_host}:{port}")
     print(f"  LLM: {settings.llm_model}")
     print(f"  Embedding: {settings.embedding_model} (dim={settings.embedding_dim})")
+    print(
+        f"  Reranker: {settings.reranker_backend} / {settings.reranker_model}"
+    )
     print(f"  Index: {settings.index_dir}")
     print(f"  Collection: {settings.qdrant_collection_name()}\n")
 

@@ -131,11 +131,21 @@ class AgenticRAGAgent:
         results = self.retriever.retrieve(query=state["query"])
         return {"raw_documents": results}
 
+    def _user_query(self, state: RAGAgentState) -> str:
+        """User-facing question (stable across retrieval retries)."""
+        return state.get("original_query") or state["query"]
+
+    def _search_query(self, state: RAGAgentState) -> str:
+        """Query used for vector/BM25/rerank (may be transformed on retry)."""
+        return state["query"]
+
     def _rerank(self, state: RAGAgentState) -> dict:
         raw_docs = state.get("raw_documents", [])
         if not raw_docs:
             return {"reranked_documents": []}
-        reranked = self.reranker.rerank(query=state["query"], documents=raw_docs)
+        reranked = self.reranker.rerank(
+            query=self._search_query(state), documents=raw_docs
+        )
         return {"reranked_documents": reranked}
 
     def _expand_parents(self, state: RAGAgentState) -> dict:
@@ -145,7 +155,7 @@ class AgenticRAGAgent:
         return {"expanded_documents": expanded}
 
     def _revalidate(self, state: RAGAgentState) -> dict:
-        query = state["query"]
+        query = self._user_query(state)
         documents = state.get("expanded_documents", [])
 
         if len(documents) < 2:
@@ -164,7 +174,7 @@ class AgenticRAGAgent:
         return {"revalidation_result": result}
 
     def _grade_relevance(self, state: RAGAgentState) -> dict:
-        query = state["query"]
+        query = self._user_query(state)
         documents = state.get("expanded_documents", [])
         grade, relevant_docs, reasoning = self.self_rag.grade_relevance_batch(
             query, documents
@@ -173,7 +183,7 @@ class AgenticRAGAgent:
         return {"relevance_grade": grade, "relevant_documents": relevant_docs}
 
     def _generate_rag(self, state: RAGAgentState) -> dict:
-        query = state["query"]
+        query = self._user_query(state)
         documents = (
             state.get("relevant_documents")
             or state.get("expanded_documents", [])
@@ -188,7 +198,7 @@ class AgenticRAGAgent:
 
     def _evaluate_rag(self, state: RAGAgentState) -> dict:
         """Evaluate RAG-generated response: support + usefulness."""
-        query = state["query"]
+        query = self._user_query(state)
         generation = state.get("generation", "")
         documents = (
             state.get("relevant_documents")
@@ -256,7 +266,7 @@ class AgenticRAGAgent:
         }
 
     def _transform_query(self, state: RAGAgentState) -> dict:
-        query = state["query"]
+        original_query = self._user_query(state)
         num_retries = state.get("num_retries", 0)
 
         support_grade = state.get("support_grade")
@@ -298,11 +308,11 @@ class AgenticRAGAgent:
         failure_reason = "; ".join(failure_parts) or "Previous attempt failed"
 
         transformed_query, strategy = self.self_rag.transform_query(
-            query, failure_reason
+            original_query, failure_reason
         )
         logger.info(
             f"Query transformed (retry {num_retries + 1}): "
-            f"'{query[:50]}...' → '{transformed_query[:50]}...' "
+            f"'{original_query[:50]}...' → '{transformed_query[:50]}...' "
             f"(strategy: {strategy})"
         )
 
@@ -342,12 +352,18 @@ class AgenticRAGAgent:
         sufficient = result.get("sufficient_information", True)
         contradictions = result.get("contradictions_found", False)
 
-        if not sufficient or contradictions:
+        # Only re-retrieve on real contradictions; partial/missing info → answer anyway
+        if contradictions:
             logger.info(
-                f"Revalidation routing: insufficient={not sufficient}, "
-                f"contradictions={contradictions} → transform query"
+                f"Revalidation routing: contradictions=True → transform query"
             )
             return "insufficient"
+
+        if not sufficient:
+            logger.info(
+                "Revalidation: insufficient information but no contradictions "
+                "→ proceed to relevance/generation"
+            )
         return "sufficient"
 
     def _check_relevance(

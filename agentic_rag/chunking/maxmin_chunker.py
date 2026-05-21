@@ -7,6 +7,7 @@ No LLM generation during ingest.
 """
 
 import logging
+from dataclasses import dataclass
 
 import numpy as np
 from langchain_core.documents import Document
@@ -14,8 +15,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sklearn.metrics.pairwise import cosine_similarity
 
 from config import settings
-from chunking.base_chunker import BaseChunker
+from chunking.base_chunker import BaseChunker, ChunkedDocument, ChunkRelation
 from chunking.embedding_client import embed_texts_batched
+from ingestion.pdf_parser import ParsedPage
+from utils import make_deterministic_id
 
 logger = logging.getLogger(__name__)
 
@@ -156,12 +159,24 @@ def _split_oversized_chunks(chunks: list[str]) -> list[str]:
     return result
 
 
+@dataclass
+class _TextPartJob:
+    sentences: list[str]
+    source_name: str
+    page_num: int
+    parent_id: str
+    parent_doc: Document
+    parent_idx: int
+    text_part_idx: int
+
+
 class MaxMinChunker(BaseChunker):
     """Child chunks via Max-Min semantic clustering on sentence embeddings."""
 
     def __init__(self):
         super().__init__()
         self._total_sentences_embedded = 0
+        self._total_embed_api_calls = 0
 
     def child_content_type(self) -> str:
         return "semantic_text_maxmin"
@@ -172,28 +187,168 @@ class MaxMinChunker(BaseChunker):
         logger.info(
             f"Max-Min chunking complete: {len(parents)} parents, "
             f"{len(children)} children "
-            f"({self._total_sentences_embedded} sentences embedded)"
+            f"({self._total_sentences_embedded} sentences embedded, "
+            f"{self._total_embed_api_calls} embed API calls)"
         )
 
-    def _chunk_text_part(
+    def chunk_document(
         self,
-        text: str,
+        pages: list[ParsedPage],
+        file_hash: str,
+        source_id: str,
+    ) -> ChunkedDocument:
+        """
+        Chunk with one embedding pass per page (not per text fragment).
+
+        Avoids hundreds of gemini-embedding API calls when parents split
+        prose into many small blocks.
+        """
+        all_parent_chunks: list[Document] = []
+        all_child_chunks: list[Document] = []
+        all_relations: list[ChunkRelation] = []
+
+        for page in pages:
+            full_text = self._merge_page_content(page)
+            if not full_text.strip():
+                continue
+
+            parent_docs = self.parent_splitter.create_documents(
+                texts=[full_text],
+                metadatas=[
+                    {
+                        "source_file": page.source_file,
+                        "page": page.page_number,
+                        "content_type": "parent",
+                        "file_hash": file_hash,
+                        "source_id": source_id,
+                    }
+                ],
+            )
+
+            jobs: list[_TextPartJob] = []
+
+            for parent_idx, parent_doc in enumerate(parent_docs):
+                parent_id = make_deterministic_id(
+                    source_id, page.page_number, "parent", parent_idx
+                )
+                parent_doc.metadata["doc_id"] = parent_id
+
+                table_blocks, text_parts = self._split_tables_and_text(
+                    parent_doc.page_content
+                )
+
+                for text_part_idx, text_part in enumerate(text_parts):
+                    if not text_part.strip() or len(
+                        text_part.strip()
+                    ) < settings.child_min_text_length:
+                        continue
+                    sentences = split_sentences(text_part)
+                    if not sentences:
+                        continue
+                    jobs.append(
+                        _TextPartJob(
+                            sentences=sentences,
+                            source_name=page.source_file,
+                            page_num=page.page_number,
+                            parent_id=parent_id,
+                            parent_doc=parent_doc,
+                            parent_idx=parent_idx,
+                            text_part_idx=text_part_idx,
+                        )
+                    )
+
+                for table_idx, (table_block, table_context) in enumerate(
+                    table_blocks
+                ):
+                    table_chunks = self._chunk_table(
+                        table_block,
+                        table_context,
+                        page.source_file,
+                        page.page_number,
+                        parent_id,
+                        file_hash,
+                        source_id,
+                        parent_idx,
+                        table_idx,
+                    )
+                    all_child_chunks.extend(table_chunks)
+
+                all_parent_chunks.append(parent_doc)
+
+            if jobs:
+                flat_sentences: list[str] = []
+                spans: list[tuple[int, int]] = []
+                for job in jobs:
+                    start = len(flat_sentences)
+                    flat_sentences.extend(job.sentences)
+                    spans.append((start, len(flat_sentences)))
+
+                vectors = embed_texts_batched(flat_sentences)
+                batch_size = max(1, settings.maxmin_embed_batch_size)
+                api_calls = (len(flat_sentences) + batch_size - 1) // batch_size
+                self._total_sentences_embedded += len(flat_sentences)
+                self._total_embed_api_calls += api_calls
+
+                logger.info(
+                    f"Page {page.page_number}: {len(flat_sentences)} sentences, "
+                    f"{api_calls} embed API call(s), {len(jobs)} text block(s)"
+                )
+
+                for job, (start, end) in zip(jobs, spans):
+                    embeddings = np.array(
+                        vectors[start:end], dtype=np.float64
+                    )
+                    child_results = self._sentences_to_child_docs(
+                        job.sentences,
+                        embeddings,
+                        job.source_name,
+                        job.page_num,
+                        job.parent_id,
+                    )
+
+                    for child_idx, (child_doc, extra_meta) in enumerate(
+                        child_results
+                    ):
+                        child_id, meta = self._build_child_metadata(
+                            child_doc=child_doc,
+                            extra_meta=extra_meta,
+                            source_id=source_id,
+                            page_num=job.page_num,
+                            parent_idx=job.parent_idx,
+                            text_part_idx=job.text_part_idx,
+                            child_idx=child_idx,
+                            parent_id=job.parent_id,
+                            file_hash=file_hash,
+                            source_id_val=source_id,
+                            content_type=self.child_content_type(),
+                        )
+                        child_doc.metadata = meta
+                        all_child_chunks.append(child_doc)
+                        all_relations.append(
+                            ChunkRelation(
+                                parent_id=job.parent_id,
+                                child_id=child_id,
+                                parent_text=job.parent_doc.page_content,
+                                child_text=child_doc.page_content,
+                                child_metadata=child_doc.metadata,
+                            )
+                        )
+
+        self._log_chunking_complete(all_parent_chunks, all_child_chunks)
+        return ChunkedDocument(
+            parent_chunks=all_parent_chunks,
+            child_chunks=all_child_chunks,
+            relations=all_relations,
+        )
+
+    def _sentences_to_child_docs(
+        self,
+        sentences: list[str],
+        embeddings: np.ndarray,
         source_name: str,
         page_num: int,
         parent_id: str,
-        file_hash: str,
-        source_id: str,
-        parent_idx: int,
-        text_part_idx: int,
     ) -> list[tuple[Document, dict]]:
-        sentences = split_sentences(text)
-        if not sentences:
-            return []
-
-        vectors = embed_texts_batched(sentences)
-        self._total_sentences_embedded += len(sentences)
-        embeddings = np.array(vectors, dtype=np.float64)
-
         grouped = maxmin_group_sentences(sentences, embeddings)
         grouped = _split_oversized_chunks(grouped)
 
@@ -215,3 +370,24 @@ class MaxMinChunker(BaseChunker):
                 )
             )
         return results
+
+    def _chunk_text_part(
+        self,
+        text: str,
+        source_name: str,
+        page_num: int,
+        parent_id: str,
+        file_hash: str,
+        source_id: str,
+        parent_idx: int,
+        text_part_idx: int,
+    ) -> list[tuple[Document, dict]]:
+        """Unused when chunk_document is overridden; kept for BaseChunker API."""
+        sentences = split_sentences(text)
+        if not sentences:
+            return []
+        vectors = embed_texts_batched(sentences)
+        embeddings = np.array(vectors, dtype=np.float64)
+        return self._sentences_to_child_docs(
+            sentences, embeddings, source_name, page_num, parent_id
+        )

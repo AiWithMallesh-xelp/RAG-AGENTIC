@@ -116,18 +116,19 @@ Respond ONLY with valid JSON:
 }
 """
 
-QUERY_TRANSFORM_PROMPT = """You are a query transformation agent. Given an original query and why previous attempts failed, transform the query.
+QUERY_TRANSFORM_PROMPT = """You are a query transformation agent for retrieval search. Given the user's ORIGINAL query and why retrieval failed, produce a search query.
 
-Strategies:
-1. Make more specific
-2. Add context
-3. Decompose into sub-queries
-4. Use synonyms
-5. Remove ambiguous terms
+Rules:
+1. MUST keep all named entities, model names, benchmarks, and product names from the original query.
+2. Do NOT change the topic or invent a different question (e.g. do not turn a paper-specific question into a generic API question).
+3. Prefer: add synonyms, expand abbreviations, remove only truly ambiguous filler words.
+4. Keep the transformed query concise (one sentence).
+
+Strategies: expand abbreviations, add synonyms, clarify ambiguous terms only.
 
 Respond ONLY with valid JSON:
 {
-  "transformed_query": "<improved query>",
+  "transformed_query": "<improved search query>",
   "strategy_used": "<which strategy>",
   "reasoning": "<why this should help>"
 }
